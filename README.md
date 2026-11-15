@@ -57,13 +57,19 @@ ready/blocked through `polecat_report`, a deterministic Deacon supervisor
 patrols thread lifecycle with a durable alert outbox, and the New Thread
 screen gets a Start Mayor launcher with a live town summary.
 
-Quick start:
+Quick start — the town asks where it should live the first time you start it.
+On bb's New Thread screen, the Madmax section offers your existing projects
+and a "new folder" option; or from the CLI:
 
 ```
-bb plugin config madmax set townProject <proj-id>   # the town bb project
-bb madmax start                                     # spawn the Mayor thread
-bb madmax rig add <proj-id>                         # register a rig
+bb madmax init --project <proj-id>        # an existing bb project becomes the town
+bb madmax init --path <dir> --name <name>  # register a fresh folder as the town
+bb madmax rig add <proj-id>               # register a rig
 ```
+
+(`bb madmax start` with no town configured prints the same choices; the town
+project can also be set directly with `bb plugin config madmax set
+townProject <proj-id>`, and moving an established town requires that command.)
 
 Roadmap:
 

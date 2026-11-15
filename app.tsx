@@ -15,6 +15,7 @@ import type { PluginSidebarThread } from "@get-bb/plugin-sdk/app";
 import type { ManagedThread, Rig, rpcContract } from "./server";
 import { Button } from "@/components/ui/button";
 import { Icon } from "@/components/ui/icon";
+import { Input } from "@/components/ui/input";
 
 type TownStatus = {
   sectionId: string | null;
@@ -54,22 +55,30 @@ function TownSection({ projectId }: { projectId: string | null }) {
   const [startError, setStartError] = useState<string | null>(null);
 
   const start = useCallback(async () => {
-    if (projectId === null || isStarting) return;
+    const town = status?.townProjectId ?? projectId;
+    if (town === null || isStarting) return;
     setStartError(null);
     setIsStarting(true);
     try {
-      const result = await rpc.call("start", { projectId });
+      const result = await rpc.call("start", { projectId: town });
       navigate.toThread(result.threadId);
     } catch (cause) {
       setStartError(cause instanceof Error ? cause.message : String(cause));
       setIsStarting(false);
     }
-  }, [isStarting, navigate, projectId, rpc]);
+  }, [isStarting, navigate, projectId, rpc, status?.townProjectId]);
+
+  // First run: no town yet — ask where it should live instead of showing a
+  // dead button.
+  if (status !== null && status.mayor === null && status.townProjectId === null) {
+    return <TownOnboarding />;
+  }
 
   const polescatThreads = status?.threads.filter((thread) => thread.role !== "mayor") ?? [];
   const problems = polescatThreads.filter((thread) => PROBLEM_STATES.has(thread.state));
   const working = polescatThreads.filter((thread) => ["active", "starting", "pending"].includes(thread.state));
   const ready = polescatThreads.filter((thread) => thread.state === "ready");
+  const townId = status?.townProjectId ?? projectId;
 
   return (
     <div className="rounded-lg border border-border bg-card text-card-foreground">
@@ -104,12 +113,121 @@ function TownSection({ projectId }: { projectId: string | null }) {
           ) : null}
         </div>
         <Button
-          disabled={projectId === null || isStarting || status?.mayor !== null}
+          disabled={townId === null || isStarting || status?.mayor !== null}
           onClick={() => void start()}
         >
           <Icon name="Landmark" className="size-4" />
           {status?.mayor ? "Mayor running" : isStarting ? "Starting…" : "Start Mayor"}
         </Button>
+      </div>
+    </div>
+  );
+}
+
+type TownProjectChoice = { projectId: string; name: string; kind: string };
+
+/** First-run chooser: where should the town live? */
+function TownOnboarding() {
+  const navigate = useBbNavigate();
+  const rpc = useRpc<typeof rpcContract>();
+  const [projects, setProjects] = useState<TownProjectChoice[] | null>(null);
+  const [busy, setBusy] = useState<string | null>(null);
+  const [error, setError] = useState<string | null>(null);
+  const [name, setName] = useState("");
+  const [path, setPath] = useState("");
+
+  const report = useCallback((cause: unknown) => {
+    setError(cause instanceof Error ? cause.message : String(cause));
+    setBusy(null);
+  }, []);
+
+  useEffect(() => {
+    rpc.call("projectsList", null).then((result) => setProjects(result.projects), report);
+  }, [rpc, report]);
+
+  const choose = useCallback(async (projectId: string) => {
+    if (busy !== null) return;
+    setBusy(projectId);
+    setError(null);
+    try {
+      const result = await rpc.call("chooseTown", { projectId });
+      navigate.toThread(result.threadId);
+    } catch (cause) {
+      report(cause);
+    }
+  }, [busy, navigate, rpc, report]);
+
+  const create = useCallback(async () => {
+    if (busy !== null || name.trim() === "" || path.trim() === "") return;
+    setBusy("new-town");
+    setError(null);
+    try {
+      const result = await rpc.call("createTown", { name: name.trim(), path: path.trim() });
+      navigate.toThread(result.threadId);
+    } catch (cause) {
+      report(cause);
+    }
+  }, [busy, name, navigate, path, rpc, report]);
+
+  return (
+    <div className="rounded-lg border border-border bg-card text-card-foreground">
+      <div className="space-y-3 px-6 py-4 text-sm">
+        <p className="text-foreground">
+          Welcome to your town. Choose the bb project that holds the Mayor and
+          the town ledger.
+        </p>
+        {error !== null ? (
+          <p role="alert" className="text-destructive">
+            {error}
+          </p>
+        ) : null}
+        {projects === null ? (
+          <p className="text-muted-foreground">Loading your projects…</p>
+        ) : projects.length === 0 ? (
+          <p className="text-muted-foreground">
+            No bb projects yet — register a folder as your town below, or create
+            a project in bb first.
+          </p>
+        ) : (
+          <ul className="flex flex-wrap gap-2">
+            {projects.map((project) => (
+              <li key={project.projectId}>
+                <Button
+                  variant="outline"
+                  disabled={busy !== null}
+                  onClick={() => void choose(project.projectId)}
+                >
+                  {busy === project.projectId ? "Starting…" : project.name}
+                </Button>
+              </li>
+            ))}
+          </ul>
+        )}
+        <div className="flex flex-wrap items-center gap-2 border-t border-border pt-3">
+          <span className="text-muted-foreground">Or a new folder:</span>
+          <Input
+            value={name}
+            onChange={(event) => setName(event.target.value)}
+            placeholder="Town name"
+            aria-label="New town name"
+            className="w-40"
+          />
+          <Input
+            value={path}
+            onChange={(event) => setPath(event.target.value)}
+            placeholder="/path/to/town"
+            aria-label="New town folder path"
+            className="w-56"
+          />
+          <Button
+            variant="outline"
+            disabled={busy !== null || name.trim() === "" || path.trim() === ""}
+            onClick={() => void create()}
+          >
+            <Icon name="Plus" className="size-4" />
+            {busy === "new-town" ? "Creating…" : "Create town"}
+          </Button>
+        </div>
       </div>
     </div>
   );

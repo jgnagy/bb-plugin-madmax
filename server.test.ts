@@ -267,4 +267,74 @@ describe("madmax town backend", () => {
     };
     expect(removed.removed).toBe(true);
   });
+
+  it("asks where the town should live when starting without one", async () => {
+    const host = await makeHost();
+    host.harness.inspection.sdk.stub("projects.list", () => [
+      { id: "proj_town", name: "MyTown", kind: "standard" },
+    ]);
+    const result = await host.harness.behavior.runCli(["start"]);
+    expect(result.exitCode).toBe(1);
+    expect(result.stderr).toContain("where should the town live");
+    expect(result.stderr).toContain("MyTown (proj_town)");
+    expect(result.stderr).toContain("bb madmax init");
+  });
+
+  it("chooseTown persists the town project and starts its Mayor", async () => {
+    const host = await makeHost();
+    await startTown(host);
+    const before = (await host.harness.behavior.callRpc("status", null)) as {
+      townProjectId: string | null;
+    };
+    expect(before.townProjectId).toBe("proj_town"); // via the running Mayor's project
+
+    const chosen = (await host.harness.behavior.callRpc("chooseTown", { projectId: "proj_town" })) as {
+      threadId: string;
+      created: boolean;
+    };
+    // A Mayor was already running for proj_town, so the choice reuses it.
+    expect(chosen.created).toBe(false);
+    const status = (await host.harness.behavior.callRpc("status", null)) as {
+      townProjectId: string | null;
+      mayor: { threadId: string } | null;
+    };
+    expect(status.townProjectId).toBe("proj_town");
+    expect(status.mayor?.threadId).toBe(chosen.threadId);
+
+    // The town is settled; moving it requires the explicit config command.
+    await expect(
+      host.harness.behavior.callRpc("chooseTown", { projectId: "proj_elsewhere" }),
+    ).rejects.toThrow(/already set/);
+  });
+
+  it("createTown registers a new folder as the town", async () => {
+    const host = await makeHost();
+    await startTown(host);
+    host.harness.inspection.sdk.stub("projects.create", (args: { name: string }) => ({
+      id: "proj_new_town",
+      name: args.name,
+      kind: "standard",
+      sources: [],
+    }));
+    const created = (await host.harness.behavior.callRpc("createTown", {
+      name: "New Town",
+      path: "/tmp/town",
+    })) as { projectId: string; threadId: string; created: boolean };
+    expect(created.projectId).toBe("proj_new_town");
+    expect(created.created).toBe(true);
+
+    const createCalls = host.harness.inspection.sdk.callsTo("projects.create");
+    expect(createCalls).toHaveLength(1);
+    expect(createCalls[0]![0]).toMatchObject({
+      name: "New Town",
+      source: { type: "local_path", hostId: "host_1", path: "/tmp/town" },
+    });
+
+    const status = (await host.harness.behavior.callRpc("status", null)) as {
+      townProjectId: string | null;
+      mayor: { threadId: string } | null;
+    };
+    expect(status.townProjectId).toBe("proj_new_town");
+    expect(status.mayor?.threadId).toBe(created.threadId);
+  });
 });

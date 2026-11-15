@@ -128,6 +128,26 @@ export const rpcContract = defineRpcContract({
     input: z.object({ projectId: z.string().trim().min(1) }).strict(),
     output: z.object({ removed: z.boolean() }).strict(),
   },
+  projectsList: {
+    input: z.null(),
+    output: z.object({
+      projects: z.array(z.object({ projectId: z.string(), name: z.string(), kind: z.string() }).strict()),
+    }).strict(),
+  },
+  chooseTown: {
+    input: z.object({ projectId: z.string().trim().min(1) }).strict(),
+    output: z.object({ threadId: z.string(), created: z.boolean() }).strict(),
+  },
+  createTown: {
+    input: z
+      .object({
+        name: z.string().trim().min(1).max(160),
+        path: z.string().trim().min(1),
+        hostId: z.string().trim().min(1).optional(),
+      })
+      .strict(),
+    output: z.object({ projectId: z.string(), threadId: z.string(), created: z.boolean() }).strict(),
+  },
 });
 
 interface ManagedRow {
@@ -421,6 +441,47 @@ export default async function plugin(bb: BbPluginApi) {
     return (activeMayor.get() as ManagedRow | undefined) ?? null;
   }
 
+  /** The configured town project, falling back to wherever the Mayor runs. */
+  async function configuredTownProject(): Promise<string | null> {
+    return ((await settings.get()).townProject as string | null) ?? mayorRow()?.project_id ?? null;
+  }
+
+  /** First-run persistence: lock in the chosen town project. */
+  async function setTownProject(projectId: string) {
+    const current = (await settings.get()).townProject as string | null;
+    if (current && current !== projectId) {
+      throw new Error(
+        `townProject is already set to ${current}. To move the town, run: bb plugin config madmax set townProject ${projectId} — then reload the plugin.`,
+      );
+    }
+    if (!current) await settings.experimental_set({ townProject: projectId });
+  }
+
+  /** The friendly "where should the town live?" message, with real choices. */
+  async function noTownMessage() {
+    let listing = "";
+    try {
+      const projects = await bb.sdk.projects.list();
+      const lines = projects.map((project) => `  ${project.name} (${project.id})`);
+      listing = lines.length
+        ? `\n\nYour bb projects:\n${lines.join("\n")}`
+        : "\n\n(No bb projects yet — create one first, or register a fresh folder:)\n  bb madmax init --path <dir> --name <name>";
+    } catch {
+      // Listing is best-effort; the commands below work regardless.
+    }
+    return [
+      "No town project configured — where should the town live?",
+      listing,
+      "\n\nPick one:",
+      "  bb madmax start --project <proj-id>     # use an existing project",
+      "  bb madmax init --path <dir> --name <n>  # register a new folder as the town",
+      "  bb plugin config madmax set townProject <proj-id>",
+      "…or click Start Mayor on bb's New Thread screen and choose there.",
+    ]
+      .filter((part) => part !== "")
+      .join("\n");
+  }
+
   async function spawnMayor(target: string, previous?: ManagedRow) {
     const values = await settings.get();
     const sectionId = await ensureSection();
@@ -468,7 +529,7 @@ export default async function plugin(bb: BbPluginApi) {
   async function ensureMayor(projectId?: string) {
     const values = await settings.get();
     const target = projectId ?? values.townProject;
-    if (!target) throw new Error("Configure the town project first: bb plugin config madmax set townProject <proj-id>");
+    if (!target) throw new Error(await noTownMessage());
     const inFlight = mayorStarts.get(target);
     if (inFlight) return inFlight;
     const start = (async () => {
@@ -489,6 +550,23 @@ export default async function plugin(bb: BbPluginApi) {
     } finally {
       mayorStarts.delete(target);
     }
+  }
+
+  /** First-run flow: choose the town project, then start its Mayor. */
+  async function chooseTown(projectId: string) {
+    await setTownProject(projectId);
+    return ensureMayor(projectId);
+  }
+
+  /** First-run flow: register a folder as a new town project and start it. */
+  async function createTown(input: { name: string; path: string; hostId?: string }) {
+    const hostId = input.hostId ?? (await defaultHostId());
+    const project = await bb.sdk.projects.create({
+      name: input.name,
+      source: { type: "local_path", hostId, path: input.path },
+    });
+    const start = await chooseTown(project.id);
+    return { projectId: project.id, threadId: start.threadId, created: start.created };
   }
 
   function isRig(projectId: string) {
@@ -980,11 +1058,11 @@ export default async function plugin(bb: BbPluginApi) {
   });
 
   bb.rpc.register(rpcContract, {
-    status: () => {
+    status: async () => {
       const mayor = mayorRow();
       return {
         sectionId: storedSectionId(),
-        townProjectId: (mayor?.project_id ?? null),
+        townProjectId: await configuredTownProject(),
         mayor: mayor ? toManaged(mayor) : null,
         threads: [...roles.values()].map(toManaged),
         rigs: (allRigs.all() as RigRow[]).map((row) => ({ projectId: row.project_id, name: row.name, registeredAt: row.registered_at })),
@@ -993,12 +1071,23 @@ export default async function plugin(bb: BbPluginApi) {
     start: ({ projectId }) => ensureMayor(projectId ?? undefined),
     rigAdd: ({ projectId }) => addRig(projectId),
     rigRemove: ({ projectId }) => ({ removed: removeRig(projectId) }),
+    projectsList: async () => ({
+      projects: (await bb.sdk.projects.list()).map((project) => ({
+        projectId: project.id,
+        name: project.name,
+        kind: project.kind,
+      })),
+    }),
+    chooseTown: ({ projectId }) => chooseTown(projectId),
+    createTown: (input) => createTown(input),
   });
 
   const usage = [
     "Usage:",
     "  bb madmax status [--json]",
-    "  bb madmax start [--json]",
+    "  bb madmax start [--project <proj-id>] [--json]",
+    "  bb madmax init --project <proj-id>",
+    "  bb madmax init --path <dir> --name <name> [--host <host-id>]",
     "  bb madmax rig list [--json]",
     "  bb madmax rig add <project-id>",
     "  bb madmax rig remove <project-id>",
@@ -1012,7 +1101,8 @@ export default async function plugin(bb: BbPluginApi) {
     summary: "Run the town: a Mayor that slings work to polecat threads across rigs",
     commands: [
       { name: "status", summary: "Show the town's roster", usage: "bb madmax status [--json]" },
-      { name: "start", summary: "Start or return the town's Mayor", usage: "bb madmax start [--json]" },
+      { name: "start", summary: "Start or return the town's Mayor", usage: "bb madmax start [--project <proj-id>] [--json]" },
+      { name: "init", summary: "Choose the town project (existing or a new folder) and start the Mayor", usage: "bb madmax init --project <proj-id> | --path <dir> --name <name> [--host <host-id>]" },
       { name: "rig", summary: "Manage registered rig projects", usage: "bb madmax rig list|add|remove" },
       { name: "sling", summary: "Sling a work item to a polecat", usage: "bb madmax sling --title \"…\" --mission \"…\" [--rig <project-id>] [--tier <tier>] [--json]" },
       { name: "nudge", summary: "Nudge a managed polecat", usage: "bb madmax nudge <thread-id> --text \"…\" [--steer] [--json]" },
@@ -1028,20 +1118,39 @@ export default async function plugin(bb: BbPluginApi) {
         if (!command || command === "help" || command === "--help") return ok({}, usage);
         if (command === "status") {
           const mayor = mayorRow();
+          const townProjectId = await configuredTownProject();
           const threads = [...roles.values()].map(toManaged);
           const rigs = (allRigs.all() as RigRow[]).map((row) => ({ projectId: row.project_id, name: row.name, registeredAt: row.registered_at }));
           return ok(
-            { sectionId: storedSectionId(), mayor: mayor ? toManaged(mayor) : null, threads, rigs },
+            { sectionId: storedSectionId(), townProjectId, mayor: mayor ? toManaged(mayor) : null, threads, rigs },
             [
-              mayor ? `Mayor: ${mayor.title} (${mayor.state}) ${mayor.thread_id}` : "No Mayor. Run: bb madmax start",
+              mayor
+                ? `Mayor: ${mayor.title} (${mayor.state}) ${mayor.thread_id}`
+                : townProjectId
+                  ? `Town: ${townProjectId} — no Mayor yet. Run: bb madmax start`
+                  : "No town yet. Run: bb madmax init",
               ...threads.filter((row) => row.role !== "mayor").map((row) => `${row.role.padEnd(8)} ${row.state.padEnd(9)} ${row.title}  ${row.threadId}`),
               ...(rigs.length ? [`Rigs: ${rigs.map((rig) => rig.name).join(", ")}`] : []),
-            ].join("\n") || "The town is quiet.",
+            ].join("\n"),
           );
         }
         if (command === "start") {
           const result = await ensureMayor(args.one("project") ?? context.projectId ?? undefined);
           return ok(result, `${result.created ? "Started" : "Using"} Mayor thread ${result.threadId}.`);
+        }
+        if (command === "init") {
+          const projectId = args.one("project");
+          const path = args.one("path");
+          const name = args.one("name");
+          if (projectId) {
+            const result = await chooseTown(projectId);
+            return ok(result, `Town project ${projectId}: ${result.created ? "started" : "using"} Mayor thread ${result.threadId}.`);
+          }
+          if (path && name) {
+            const result = await createTown({ name, path, hostId: args.one("host") });
+            return ok(result, `Created town “${name}” (${result.projectId}) and ${result.created ? "started" : "reused"} Mayor thread ${result.threadId}.`);
+          }
+          return fail("init requires --project <proj-id>, or --path <dir> --name <name> [--host <host-id>]");
         }
         if (command === "rig") {
           const [sub, target] = args.positional;
