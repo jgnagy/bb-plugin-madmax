@@ -179,6 +179,11 @@ CI runs the typecheck and the full suite (with `bd` installed) on every
 push. The plugin API ships on disk after `npm install` at
 `node_modules/@get-bb/plugin-sdk/bundled-types/bb-plugin-sdk.d.ts`.
 
+**Releases are git tags.** bb's git installer resolves `@semver:` ranges
+against `vX.Y.Z` tags — `package.json`'s version alone is not enough. To
+cut a release: bump `version` in `package.json`, commit, then
+`git tag -a vX.Y.Z -m "…"` and `git push origin vX.Y.Z`.
+
 ## Lineage
 
 - [Gas Town](https://github.com/gastownhall/gastown) (MIT, retired) — the
