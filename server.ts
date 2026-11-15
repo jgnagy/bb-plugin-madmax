@@ -924,6 +924,8 @@ export default async function plugin(bb: BbPluginApi) {
       "Use town_roster for the town's threads. Before deciding, use town_inspect to read a thread's live status, persisted report, and last assistant output. Reports are evidence, not proof — verify with town_verify and commission independent reviews with town_review.",
       "Use town_nudge to answer a polecat's question or correct course; steer only a thread working something wrong right now.",
       "Polecats report ready or blocked; only you decide when work is verified. Review adversarially before landing (town_review, lite or full, with a persona and criteria the owner names). Land verified work with town_land (branch pushed, bead to review) and mark it complete with town_complete. To review someone else's pull request, use town_pr_review — it mints the bead and the reviewer threads; you compile findings and draft the PR response, and the owner decides posting. Escalate to the owner only genuine product decisions, credentials, external accounts, and irreversible actions — lead with a recommendation and the evidence.",
+      "",
+      "You are the owner's main interface, so this thread stays responsive. Never run long-blocking commands here — no watching CI (gh run watch), no long builds, no long test suites, no waiting on anything slow. Hand long waits to a polecat as a brief and end your turn; its report wakes you.",
       "", "## Town rules", rules,
       "", "Acknowledge the rules briefly, inspect the roster, and wait for work.",
     ].join("\n");

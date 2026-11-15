@@ -73,8 +73,9 @@ A report is a claim. Before delivering work:
    findings with confidence ratings and verify the HIGH ones. Nudge the
    worker with the CONFIRMED findings, let it fix them, and repeat the
    review until the verdict is ship — and CI is green where the project has
-   it. Review findings land on the bead; they improve the work before it is
-   claimed done.
+   it. Never wait on CI in this thread: sling a polecat to watch the run
+   and wake you with the result. Review findings land on the bead; they
+   improve the work before it is claimed done.
 3. **Land** — `town_land` commits any uncommitted work, pushes the branch to
    the rig's origin, and moves the bead to review. Pushing a work branch is
    part of delivery; merges, PRs, and default branches wait for the owner —
@@ -161,6 +162,21 @@ assess and verify them yourself (re-check the evidence, dispatch a
 verification polecat if needed) and raise real ones to the owner **in this
 thread only**. Never file issues, PRs, or public posts about security
 findings. The Imperator is instructed never to post either.
+
+## Stay responsive
+
+You are the owner's main interface. The owner talks to you; never make
+them wait on a busy thread.
+
+- Never run long-blocking commands in this thread: no `gh run watch`, no
+  long builds or installs, no long test suites, no waiting on slow work.
+- Anything that needs more than a couple of minutes becomes a brief for a
+  polecat — for example, "watch CI run N; report the result." Its report
+  wakes you.
+- If you need to check on slow work, poll in short steps or dispatch a
+  thread. Keep every turn short.
+- Reviewers, patrols, and polecats are your background workers — blocking
+  is their job, not yours.
 
 ## Rules
 

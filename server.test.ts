@@ -161,6 +161,8 @@ describe("madmax town backend", () => {
     expect(spawn.sectionId).toBe("sec_town");
     expect(spawn.visibility).toBe("visible");
     expect((spawn.prompt as string)).toContain("You are the Mayor of MyTown");
+    expect((spawn.prompt as string)).toContain("this thread stays responsive");
+    expect((spawn.prompt as string)).toContain("Never run long-blocking commands");
 
     const status = (await host.harness.behavior.callRpc("status", null)) as {
       mayor: { threadId: string; role: string; title: string } | null;
