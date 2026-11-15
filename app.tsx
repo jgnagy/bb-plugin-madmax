@@ -16,6 +16,15 @@ import type { ManagedThread, Rig, rpcContract } from "./server";
 import { Button } from "@/components/ui/button";
 import { Icon } from "@/components/ui/icon";
 import { Input } from "@/components/ui/input";
+import {
+  Dialog,
+  DialogClose,
+  DialogContent,
+  DialogDescription,
+  DialogFooter,
+  DialogHeader,
+  DialogTitle,
+} from "@/components/ui/dialog";
 
 type TownStatus = {
   sectionId: string | null;
@@ -126,6 +135,135 @@ function TownSection({ projectId }: { projectId: string | null }) {
 
 type TownProjectChoice = { projectId: string; name: string; kind: string };
 
+type DirectoryBrowse = {
+  hostId: string;
+  directory: string;
+  parent: string | null;
+  roots: string[];
+  directories: { name: string; path: string }[];
+};
+
+/** Folder picker dialog backed by hosts.directory on the connected host. */
+function FolderBrowser({
+  open,
+  onOpenChange,
+  onChoose,
+}: {
+  open: boolean;
+  onOpenChange: (open: boolean) => void;
+  onChoose: (path: string) => void;
+}) {
+  const rpc = useRpc<typeof rpcContract>();
+  const [listing, setListing] = useState<DirectoryBrowse | null>(null);
+  const [error, setError] = useState<string | null>(null);
+
+  const load = useCallback(
+    (path?: string) => {
+      setListing(null);
+      setError(null);
+      rpc
+        .call("browseTownDirectories", path ? { path } : {})
+        .then(setListing, (cause: unknown) =>
+          setError(cause instanceof Error ? cause.message : String(cause)),
+        );
+    },
+    [rpc],
+  );
+
+  useEffect(() => {
+    if (open) load();
+  }, [open, load]);
+
+  return (
+    <Dialog open={open} onOpenChange={onOpenChange}>
+      <DialogContent className="max-w-md">
+        <DialogHeader>
+          <DialogTitle>Choose a town folder</DialogTitle>
+          <DialogDescription>
+            Pick where the town lives on disk. The folder is created if it
+            doesn't exist yet.
+          </DialogDescription>
+        </DialogHeader>
+        {error !== null ? (
+          <p role="alert" className="text-sm text-destructive">
+            {error}
+          </p>
+        ) : null}
+        {listing === null ? (
+          <p className="py-8 text-center text-sm text-muted-foreground">
+            {error === null ? "Loading folders…" : ""}
+          </p>
+        ) : (
+          <div className="space-y-3">
+            <div className="flex items-center gap-2">
+              <code
+                className="min-w-0 flex-1 truncate rounded-md border border-border bg-muted px-2 py-1.5 font-mono text-xs"
+                title={listing.directory}
+              >
+                {listing.directory}
+              </code>
+              <Button
+                variant="outline"
+                size="icon"
+                aria-label="Go to home folder"
+                onClick={() => load()}
+              >
+                <Icon name="House" className="size-4" />
+              </Button>
+              <Button
+                variant="outline"
+                size="icon"
+                aria-label="Go to parent folder"
+                disabled={listing.parent === null}
+                onClick={() => load(listing.parent ?? undefined)}
+              >
+                <Icon name="ArrowUp" className="size-4" />
+              </Button>
+            </div>
+            <ul className="max-h-64 space-y-1 overflow-y-auto rounded-md border border-border p-1">
+              {listing.directories.length === 0 ? (
+                <li className="px-2 py-1.5 text-sm text-muted-foreground">
+                  No subfolders here.
+                </li>
+              ) : (
+                listing.directories.map((entry) => (
+                  <li key={entry.path}>
+                    <button
+                      type="button"
+                      className="flex w-full items-center gap-2 rounded-md px-2 py-1.5 text-left text-sm hover:bg-state-hover focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-ring"
+                      onClick={() => load(entry.path)}
+                    >
+                      <Icon name="Folder" className="size-4 shrink-0 text-muted-foreground" />
+                      <span className="truncate">{entry.name}</span>
+                    </button>
+                  </li>
+                ))
+              )}
+            </ul>
+          </div>
+        )}
+        <DialogFooter>
+          <DialogClose asChild>
+            <Button variant="outline">Cancel</Button>
+          </DialogClose>
+          <Button
+            disabled={listing === null}
+            onClick={() => {
+              if (listing !== null) {
+                onChoose(listing.directory);
+                onOpenChange(false);
+              }
+            }}
+          >
+            <Icon name="Check" className="size-4" />
+            Use this folder
+          </Button>
+        </DialogFooter>
+      </DialogContent>
+    </Dialog>
+  );
+}
+
 /** First-run chooser: where should the town live? */
 function TownOnboarding() {
   const navigate = useBbNavigate();
@@ -135,6 +273,7 @@ function TownOnboarding() {
   const [error, setError] = useState<string | null>(null);
   const [name, setName] = useState("");
   const [path, setPath] = useState("");
+  const [browseOpen, setBrowseOpen] = useState(false);
 
   const report = useCallback((cause: unknown) => {
     setError(cause instanceof Error ? cause.message : String(cause));
@@ -223,6 +362,15 @@ function TownOnboarding() {
           />
           <Button
             variant="outline"
+            size="icon"
+            aria-label="Browse folders"
+            disabled={busy !== null}
+            onClick={() => setBrowseOpen(true)}
+          >
+            <Icon name="FolderOpen" className="size-4" />
+          </Button>
+          <Button
+            variant="outline"
             disabled={busy !== null || name.trim() === "" || path.trim() === ""}
             onClick={() => void create()}
           >
@@ -230,6 +378,11 @@ function TownOnboarding() {
             {busy === "new-town" ? "Creating…" : "Create town"}
           </Button>
         </div>
+        <FolderBrowser
+          open={browseOpen}
+          onOpenChange={setBrowseOpen}
+          onChoose={(chosen) => setPath(chosen)}
+        />
       </div>
     </div>
   );

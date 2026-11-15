@@ -150,6 +150,18 @@ export const rpcContract = defineRpcContract({
       .strict(),
     output: z.object({ projectId: z.string(), threadId: z.string(), created: z.boolean() }).strict(),
   },
+  browseTownDirectories: {
+    input: z.object({ path: z.string().trim().min(1).optional() }).strict(),
+    output: z
+      .object({
+        hostId: z.string(),
+        directory: z.string(),
+        parent: z.string().nullable(),
+        roots: z.array(z.string()),
+        directories: z.array(z.object({ name: z.string(), path: z.string() }).strict()),
+      })
+      .strict(),
+  },
 });
 
 interface ManagedRow {
@@ -1132,6 +1144,21 @@ export default async function plugin(bb: BbPluginApi) {
     }),
     chooseTown: ({ projectId }) => chooseTown(projectId),
     createTown: (input) => createTown(input),
+    browseTownDirectories: async ({ path }) => {
+      const hostId = await defaultHostId();
+      const listing = await bb.sdk.hosts.directory({ hostId, ...(path ? { path } : {}) });
+      const directories = listing.entries
+        .filter((entry) => entry.kind === "directory")
+        .map((entry) => ({ name: entry.name, path: entry.path }))
+        .sort((a, b) => a.name.localeCompare(b.name));
+      return {
+        hostId,
+        directory: listing.directory,
+        parent: listing.parent,
+        roots: listing.roots,
+        directories,
+      };
+    },
   });
 
   const usage = [

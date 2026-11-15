@@ -354,6 +354,38 @@ describe("madmax town backend", () => {
     expect(status.mayor?.threadId).toBe(created.threadId);
   });
 
+  it("browseTownDirectories lists only directories from the host", async () => {
+    const host = await makeHost();
+    host.harness.inspection.sdk.stub("hosts.list", () => [{ id: "host_1", status: "connected" }]);
+    host.harness.inspection.sdk.stub("hosts.directory", (args: { path?: string }) => ({
+      directory: args.path ?? "/Users/demo",
+      parent: args.path ? "/Users" : null,
+      roots: ["/"],
+      entries: [
+        { kind: "directory", name: "zed", path: "/Users/demo/zed" },
+        { kind: "file", name: "notes.txt", path: "/Users/demo/notes.txt" },
+        { kind: "directory", name: "alpha", path: "/Users/demo/alpha" },
+        { kind: "file", name: "town.md", path: "/Users/demo/town.md" },
+        { kind: "directory", name: ".hidden", path: "/Users/demo/.hidden" },
+      ],
+    }));
+    const top = (await host.harness.behavior.callRpc("browseTownDirectories", {})) as {
+      directory: string;
+      directories: { name: string }[];
+    };
+    expect(top.directory).toBe("/Users/demo");
+    expect(top.directories.map((entry) => entry.name)).toEqual([".hidden", "alpha", "zed"]);
+
+    const inside = (await host.harness.behavior.callRpc("browseTownDirectories", {
+      path: "/Users/demo/alpha",
+    })) as { directory: string; parent: string | null };
+    expect(inside.directory).toBe("/Users/demo/alpha");
+    expect(inside.parent).toBe("/Users");
+    expect(
+      host.harness.inspection.sdk.callsTo("hosts.directory")[1]![0],
+    ).toMatchObject({ hostId: "host_1", path: "/Users/demo/alpha" });
+  });
+
   it("createTown keeps an existing town.md and expands ~ paths", async () => {
     const host = await makeHost();
     await startTown(host);
