@@ -85,7 +85,15 @@ retries, mayor revival.
 - Reviewer read-only-ness is prompt-level (bb has no read-only permission
   mode); repairs require the Mayor's explicit `authorizeEdits` nudge.
 - Verify/land shell out to `git` in the worktree path, so the worktree must
-  live on the bb server's machine (single-host towns today).
+  live on the bb server's machine (single-host towns today). Future fix:
+  a `bb.host` worker (`experimental_defineHostEntry`) can spawn git/bd on
+  the machine a checkout lives on — the technique third-party beads
+  plugins use; adopt natively when multi-host towns matter.
 - `hosts.pickFolder` (native OS folder dialog) needs a `clientHostId` the
   plugin app has no documented way to learn, so onboarding uses the in-app
   `hosts.directory` browser instead.
+- Third-party generic `bd` passthrough plugins are complementary at the
+  owner's discretion, not integration targets: they expose no
+  plugin-callable RPC, and their per-thread scoping (bd in the thread's
+  checkout) is the wrong-ledger foot-gun madmax's `-C <town>` scoping
+  exists to prevent.
