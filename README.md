@@ -50,16 +50,18 @@ the alert outbox.
 
 ## Status
 
-Phase 3 — the Town Hall. A **Town Hall** page in bb's sidebar shows the town
-problems-first: blocked/failed threads under "Needs attention", the convoy
-board (epics with their beads, ready/blocked/running states, linked polecat
-threads), the live roster, and a newest-first activity feed covering every
-sling, report, nudge, completion, stall, and rig change — all updated live.
-Phase 2 gave the town its Beads ledger: convoys are epics (`town_convoy`),
-rig labels route slings, beads are claimed at sling time and closed at
-verified completion, every polecat report lands on its bead as a comment,
-the Deacon heartbeats active claims, and new towns bootstrap with
-`git init` + `bd init`.
+Phase 4 — the refinery. The Mayor drives finished work through delivery:
+`town_verify` gathers deterministic git evidence from the polecat's worktree
+(status, diff, log), `town_review` commissions an independent read-only
+reviewer thread in that same worktree (verdicts recorded on the bead;
+repair passes only with explicit authorization), and `town_land` commits any
+uncommitted work, pushes the branch to the rig's origin, and moves the bead
+to a `review` status in the ledger — the owner alone decides the merge path.
+Town ledgers register the `review` status at init.
+
+With Phase 3's Town Hall page (problems-first board, roster, activity feed)
+and Phase 2's Beads ledger underneath, the four planned phases are complete:
+madmax is a full Gas Town for bb.
 
 Quick start — the town asks where it should live the first time you start it.
 On bb's New Thread screen, the Madmax section offers importing an existing
@@ -82,7 +84,11 @@ Roadmap:
 - [x] Phase 1 — core: roles, section, spawn/sling across rigs, outbox, supervisor
 - [x] Phase 2 — Beads layer: `bd` shell-out, convoys, bead↔thread linkage
 - [x] Phase 3 — Town Hall UI: problems view, convoy board, roster, feed
-- [ ] Phase 4 — refinery: verify, deliver, reviewer threads, landing flow
+- [x] Phase 4 — refinery: verify, deliver, reviewer threads, landing flow
+
+Later, if the town wants them: molecules/formulas (`bd cook`), scheduler
+capacity (compose with bb's concurrency-limit), and Wasteland federation
+via `bd dolt` remotes.
 
 ## Develop
 

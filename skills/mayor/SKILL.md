@@ -35,7 +35,10 @@ directly with `bd` in the town checkout (reports arrive as bead comments).
 | `town_sling` | Start one polecat per bead (`beadId`), or from a raw title+mission brief. Pick the model tier honestly: `simplest` for trivial mechanical work, `small` for lookups and single-file changes, `medium` for multi-file features, `difficult` (default) for tricky logic, `mostDifficult` for adversarial or security-sensitive work. |
 | `town_roster` | The town's managed threads with persisted state and latest reports. |
 | `town_inspect` | One thread's live status, persisted report, and last assistant output. Read evidence here before deciding. |
-| `town_nudge` | Send a self-contained instruction. Use `steer: true` only to interrupt a thread working something wrong right now; otherwise let it queue. |
+| `town_verify` | Deterministic worktree evidence for a thread: git status, diff stat, recent log. Run this before trusting any report. |
+| `town_review` | Commission an independent, read-only reviewer thread in the polecat's own worktree (idle polecats only). The ship/fix verdict lands on the bead. |
+| `town_land` | Deliver verified work: commit any uncommitted polecat work, push its branch to the rig's origin, move the bead to review. The owner alone decides the merge. |
+| `town_nudge` | Send a self-contained instruction. Use `steer: true` only to interrupt a thread working something wrong right now; otherwise let it queue. Reviewers stay read-only unless you pass `authorizeEdits: true`. |
 | `town_complete` | Mark a thread complete after verifying its evidence; closes the linked bead in the ledger. |
 
 ## Procedure
@@ -48,10 +51,25 @@ directly with `bd` in the town checkout (reports arrive as bead comments).
 3. On lifecycle alerts, choose the safest useful action:
    - `town_nudge` when a concrete, reversible next instruction is supported by
      evidence you inspected with `town_inspect`.
-   - `town_complete` only after sufficient evidence and only while the thread
-     is not running.
    - Escalate to the owner in this thread when a genuine product decision,
      credential, external account, or irreversible action remains.
+
+## The refinery: verify → review → land → complete
+
+A report is a claim. Before delivering work:
+
+1. **Verify** — `town_verify` gathers deterministic git evidence from the
+   worktree (status, diff, log). A report that says "done" without a runnable
+   check is not done.
+2. **Review** — for meaningful or risky changes, `town_review` an independent
+   read-only reviewer in the polecat's worktree. Weigh its ship/fix verdict
+   (recorded on the bead) with the evidence.
+3. **Land** — `town_land` commits any uncommitted work, pushes the branch to
+   the rig's origin, and moves the bead to review. Pushing a work branch is
+   part of delivery; merges, PRs, and default branches wait for the owner —
+   offer the next moves and let the owner choose.
+4. **Complete** — once the owner accepts, `town_complete` the thread; the bead
+   closes in the ledger.
 4. Escalation flows polecat → Mayor → owner. Resolve what you can from
      settled decisions or the bead; put real decisions to the owner plainly,
      leading with your recommendation and the smallest set of choices, and

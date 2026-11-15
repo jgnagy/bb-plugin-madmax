@@ -47,22 +47,25 @@ below was confirmed against the real declarations, not docs.
 - `plugin_meta` (key/value) — section id, schema version
 - `rigs` (project_id PK, name, registered_at) — registered rig bb projects
 - `town_threads` (thread_id PK, role `mayor|polecat|reviewer`, project_id,
-  rig_project_id?, mayor_thread_id?, bead_id?, title, state, status, result,
-  blocker, recommendation, active_since, active_cycle, stall_alerted_cycle,
-  created_at, updated_at) — bead↔thread mapping + live-state cache
-- `alert_outbox` (dedupe_key PK, target_thread_id, source_thread_id, message,
-  delivered_at, attempts, last_error, created_at) — durable Mayor alerts
+  rig_project_id?, mayor_thread_id?, worker_thread_id?, bead_id?, title,
+  state, status, result, blocker, recommendation, active_since,
+  active_cycle, stall_alerted_cycle, created_at, updated_at) — bead↔thread
+  mapping + live-state cache
+- `alert_outbox` (dedupe_key PK, target_thread_id, source_thread_id,
+  message, delivered_at, attempts, last_error, created_at) — durable alerts
+- `town_events` (id, at, kind, message, thread_id, bead_id) — activity feed
 
-**Roles & tools:** Mayor: `town_sling` (bead, tier, brief), `town_nudge`,
-`town_roster`, `town_inspect`; Polecat/Reviewer: `polecat_report`
-(ready/blocked, Chief's discriminated union). Reviewer spawn, verify, and
-landing flow land in Phase 4.
+**Roles & tools:** Mayor: `town_sling`, `town_nudge`, `town_roster`,
+`town_inspect`, `town_convoy`, `town_ready`, `town_verify`, `town_review`,
+`town_land`, `town_complete`; Polecat/Reviewer: `polecat_report`.
 
-**CLI:** `bb madmax status | start | rig list/add | sling | nudge | inspect`.
+**CLI:** `bb madmax status | start | init | ledger | rig | sling | nudge |
+inspect | review | verify | land`.
 
-**Supervisor:** 30s reconcile (live `threads.get` vs cache, section refiling,
-state repair — never treat an SDK error as deletion), stall detection
-(`active_since` > `stallMinutes`), outbox retries, mayor revival.
+**Supervisor:** 30s reconcile (live `threads.get` vs cache, section
+refiling, state repair — never treat an SDK error as deletion), stall
+detection (`active_since` > `stallMinutes`), claim-lease heartbeats, outbox
+retries, mayor revival.
 
 ## Open items
 

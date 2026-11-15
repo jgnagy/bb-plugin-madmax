@@ -269,6 +269,7 @@ interface ManagedRow {
   role: z.infer<typeof roleSchema>;
   project_id: string;
   mayor_thread_id: string | null;
+  worker_thread_id: string | null;
   bead_id: string | null;
   tier: Tier | null;
   title: string;
@@ -373,6 +374,9 @@ export default async function plugin(bb: BbPluginApi) {
     mayorProvider: { type: "string", label: "Mayor provider", default: "" },
     mayorModel: { type: "string", label: "Mayor model", default: "" },
     mayorReasoning: { type: "select", label: "Mayor reasoning", options: [...reasoningOptions], default: "high" },
+    reviewerProvider: { type: "string", label: "Reviewer provider", default: "" },
+    reviewerModel: { type: "string", label: "Reviewer model", default: "" },
+    reviewerReasoning: { type: "select", label: "Reviewer reasoning", options: [...reasoningOptions], default: "high" },
     polecatPermissionMode: {
       type: "select",
       label: "Polecat permission mode",
@@ -445,6 +449,7 @@ export default async function plugin(bb: BbPluginApi) {
       thread_id TEXT,
       bead_id TEXT
     )`,
+    `ALTER TABLE town_threads ADD COLUMN worker_thread_id TEXT`,
   ]);
 
   const allRows = db.prepare(`SELECT * FROM town_threads ORDER BY created_at ASC`);
@@ -707,14 +712,24 @@ export default async function plugin(bb: BbPluginApi) {
     }
   }
 
+  async function initLedgerAt(path: string) {
+    await execFileAsync("bd", ["init"], { cwd: path, timeout: BD_TIMEOUT_MS, maxBuffer: 16 * 1024 * 1024 });
+    // The refinery lands beads in a review status; bd needs it registered.
+    await execFileAsync("bd", ["config", "set", "status.custom", "review"], {
+      cwd: path,
+      timeout: BD_TIMEOUT_MS,
+      maxBuffer: 16 * 1024 * 1024,
+    }).catch((error) => bb.log.warn(`status.custom review not set: ${String(error)}`));
+    ledgerCache = null;
+  }
+
   async function initLedger(): Promise<{ initialized: boolean; path: string }> {
     const path = await townLedgerDir();
     if (existsSync(join(path, ".beads"))) return { initialized: true, path };
     if (!(await isBdAvailable())) {
       throw new Error("bd (Beads) was not found on the bb server machine — install it: https://github.com/gastownhall/beads");
     }
-    await execFileAsync("bd", ["init"], { cwd: path, timeout: BD_TIMEOUT_MS, maxBuffer: 16 * 1024 * 1024 });
-    ledgerCache = null;
+    await initLedgerAt(path);
     logEvent("ledger", `Ledger initialized at ${path}`);
     return { initialized: true, path };
   }
@@ -830,9 +845,9 @@ export default async function plugin(bb: BbPluginApi) {
       `You are the Mayor of ${name} — the town's chief-of-staff agent. You coordinate work across the town's registered rig projects through visible polecat threads.`,
       "",
       "Use town_sling to start one polecat per self-contained work item; choose the model tier honestly (simplest for trivial mechanical work, small for lookups and single-file changes, medium for multi-file features, difficult for tricky logic, mostDifficult for adversarial or security-sensitive work).",
-      "Use town_roster for the town's threads. Before deciding, use town_inspect to read a thread's live status, persisted report, and last assistant output. Reports are evidence, not proof.",
+      "Use town_roster for the town's threads. Before deciding, use town_inspect to read a thread's live status, persisted report, and last assistant output. Reports are evidence, not proof — verify with town_verify and commission independent reviews with town_review.",
       "Use town_nudge to answer a polecat's question or correct course; steer only a thread working something wrong right now.",
-      "Polecats report ready or blocked; only you decide when work is verified and complete. Escalate to the owner only genuine product decisions, credentials, external accounts, and irreversible actions — lead with a recommendation and the evidence.",
+      "Polecats report ready or blocked; only you decide when work is verified. Land verified work with town_land (branch pushed, bead to review) and mark it complete with town_complete. Escalate to the owner only genuine product decisions, credentials, external accounts, and irreversible actions — lead with a recommendation and the evidence.",
       "", "## Town rules", rules,
       "", "Acknowledge the rules briefly, inspect the roster, and wait for work.",
     ].join("\n");
@@ -938,8 +953,7 @@ export default async function plugin(bb: BbPluginApi) {
     }
     try {
       if (!existsSync(join(path, ".beads")) && (await isBdAvailable())) {
-        await execFileAsync("bd", ["init"], { cwd: path, timeout: BD_TIMEOUT_MS, maxBuffer: 16 * 1024 * 1024 });
-        invalidateLedger();
+        await initLedgerAt(path);
       }
     } catch (error) {
       bb.log.warn(`bd init skipped for the new town: ${String(error)}`);
@@ -1080,16 +1094,22 @@ export default async function plugin(bb: BbPluginApi) {
     return { threadId: thread.id, title, projectId: rigProjectId, tier, beadId: bead?.id ?? null };
   }
 
-  async function nudge(threadId: string, text: string, steer = false) {
+  async function nudge(threadId: string, text: string, steer = false, authorizeEdits = false) {
     const row = roles.get(threadId);
     if (!row || row.role === "mayor") throw new Error(`No managed polecat or reviewer ${threadId}.`);
+    const payload =
+      row.role === "reviewer"
+        ? authorizeEdits
+          ? `The Mayor explicitly authorizes a repair pass for this instruction: edits are allowed.\n\n${text}`
+          : `Remain review-only: do not modify files.\n\n${text}`
+        : text;
     await bb.sdk.threads.send({
       threadId,
       mode: steer ? "steer-if-active" : "queue-if-active",
-      input: [{ type: "text", text: clip(text, MAX_RESULT_LENGTH), mentions: [] }],
+      input: [{ type: "text", text: clip(payload, MAX_RESULT_LENGTH), mentions: [] }],
       senderThreadId: row.mayor_thread_id ?? undefined,
     });
-    logEvent("nudge", `Nudged “${row.title}”${steer ? " (steering the running turn)" : ""}`, threadId);
+    logEvent("nudge", `Nudged “${row.title}”${steer ? " (steering the running turn)" : ""}${authorizeEdits ? " (repair authorized)" : ""}`, threadId);
     db.prepare(`UPDATE town_threads SET state='active', blocker=NULL, recommendation=NULL,
       active_since=?, active_cycle=active_cycle+1, stall_alerted_cycle=NULL, updated_at=? WHERE thread_id=?`).run(
       Date.now(), Date.now(), threadId,
@@ -1253,6 +1273,161 @@ export default async function plugin(bb: BbPluginApi) {
       }
     }
     return { threadId, title: current.title, beadId: current.bead_id, note };
+  }
+
+  // ── The refinery: verify, review, land ──────────────────────────────
+  // The Mayor is the refinery: it gathers deterministic evidence from the
+  // worktree, can commission an independent read-only review, and delivers
+  // finished work — branch pushed, bead to review — while the owner alone
+  // decides the merge path.
+
+  async function runGit(worktree: string, args: string[]): Promise<string> {
+    try {
+      const { stdout } = await execFileAsync("git", ["-C", worktree, ...args], {
+        timeout: 30_000,
+        maxBuffer: 16 * 1024 * 1024,
+      });
+      return stdout;
+    } catch (error) {
+      const detail = error instanceof Error ? error.message : String(error);
+      throw new Error(`git ${args.join(" ")} failed in ${worktree}: ${clip(detail, 1_000)}`);
+    }
+  }
+
+  async function threadWorktree(threadId: string): Promise<{ path: string; branchName: string | null }> {
+    const thread = await bb.sdk.threads.get({ threadId });
+    if (thread.deletedAt !== null || thread.archivedAt !== null) {
+      throw new Error(`${threadId} is not a live thread.`);
+    }
+    if (!thread.environmentId) {
+      throw new Error(`${threadId} has no reusable environment (no worktree).`);
+    }
+    const environment = await bb.sdk.environments.get({ environmentId: thread.environmentId });
+    if (!environment.path) {
+      throw new Error(`The environment for ${threadId} has no local path; the refinery needs the worktree on the bb server's machine.`);
+    }
+    return { path: environment.path, branchName: environment.branchName };
+  }
+
+  /** Deterministic evidence: git status, diff stat, and recent log. */
+  async function verify(threadId: string) {
+    const row = roles.get(threadId);
+    if (!row || row.role === "mayor") throw new Error(`No managed polecat or reviewer ${threadId}.`);
+    const { path, branchName } = await threadWorktree(threadId);
+    const attempt = async (args: string[]) => runGit(path, args).catch((error) => `(${clip(String(error), 400)})`);
+    const [status, diff, log] = await Promise.all([
+      attempt(["status", "--porcelain=v1", "-b"]),
+      attempt(["diff", "--stat", "HEAD"]),
+      attempt(["log", "--oneline", "-8"]),
+    ]);
+    logEvent("verify", `Gathered worktree evidence for “${row.title}”`, threadId, row.bead_id);
+    return [
+      `Worktree: ${path}`,
+      `Branch: ${branchName ?? "(detached)"}`,
+      "",
+      "## Status",
+      status.trim() === "" ? "(clean)" : status,
+      "",
+      "## Diff against HEAD",
+      diff.trim() === "" ? "(no unstaged changes)" : diff,
+      "",
+      "## Recent log",
+      log.trim() === "" ? "(no commits yet)" : log,
+    ].join("\n");
+  }
+
+  /** Deliver: commit uncommitted polecat work, push the branch, bead to review. */
+  async function land(threadId: string) {
+    const row = roles.get(threadId);
+    if (!row || row.role === "mayor") throw new Error(`No managed polecat or reviewer ${threadId}.`);
+    const live = await bb.sdk.threads.get({ threadId });
+    if (BUSY_STATUSES.has(live.status)) throw new Error(`Cannot land ${threadId} while it is ${live.status}.`);
+    const { path, branchName } = await threadWorktree(threadId);
+    const changes = await runGit(path, ["status", "--porcelain=v1"]);
+    let commitNote = "no uncommitted changes";
+    if (changes.trim() !== "") {
+      await runGit(path, ["add", "-A"]);
+      await runGit(path, ["commit", "-m", `polecat work: ${row.title}${row.bead_id ? ` (bead ${row.bead_id})` : ""}`]);
+      commitNote = "uncommitted polecat work committed";
+    }
+    await runGit(path, ["push", "-u", "origin", "HEAD"]);
+    const pushedBranch = branchName ?? "HEAD";
+    let beadNote = "";
+    if (row.bead_id) {
+      try {
+        await runBd(["update", row.bead_id, "--status", "review"]);
+        await runBd([
+          "comment",
+          row.bead_id,
+          `Landed: branch ${pushedBranch} pushed to origin. Awaiting the owner's merge decision.`,
+        ]);
+        invalidateLedger();
+        beadNote = `- Bead ${row.bead_id} moved to review in the ledger.`;
+      } catch (error) {
+        bb.log.warn(`Bead ${row.bead_id} could not move to review: ${String(error)}`);
+        beadNote = `- WARNING: bead ${row.bead_id} could not move to review (${clip(String(error), 200)}). If the status is unknown, run: bd config set status.custom review`;
+      }
+    }
+    logEvent("land", `Landed “${row.title}” — ${pushedBranch} pushed (${commitNote})`, threadId, row.bead_id);
+    return [
+      `Landed “${row.title}”:`,
+      `- Branch ${pushedBranch} pushed to origin (${commitNote}).`,
+      beadNote,
+      "The owner decides the merge path; never merge or touch a default branch without the owner's explicit say-so.",
+    ]
+      .filter((line) => line !== "")
+      .join("\n");
+  }
+
+  /** Commission an independent, read-only review in the worker's worktree. */
+  async function startReview(threadId: string, focus?: string) {
+    const worker = roles.get(threadId);
+    if (!worker || worker.role !== "polecat") throw new Error(`No managed polecat ${threadId}.`);
+    const existing = db
+      .prepare(`SELECT * FROM town_threads WHERE role='reviewer' AND worker_thread_id=? AND state NOT IN ('complete','archived','deleted') LIMIT 1`)
+      .get(threadId) as ManagedRow | undefined;
+    if (existing) return { threadId: existing.thread_id, title: existing.title, created: false };
+    const live = await bb.sdk.threads.get({ threadId });
+    if (BUSY_STATUSES.has(live.status)) {
+      throw new Error(`Polecat ${threadId} is ${live.status}; wait until it is idle before starting a review.`);
+    }
+    if (live.deletedAt !== null || live.archivedAt !== null) throw new Error(`Polecat ${threadId} is not reviewable.`);
+    if (!live.environmentId) throw new Error(`Polecat ${threadId} has no reusable worktree to review.`);
+    const values = await settings.get();
+    const sectionId = await ensureSection();
+    const title = `Review · ${worker.title}`;
+    const prompt = [
+      `Independently review the polecat work for “${worker.title}” (thread ${threadId}).`,
+      focus ? `Review focus: ${focus}` : "Review for correctness, regressions, validation quality, and unnecessary complexity.",
+      "This is a read-only review: do not modify files unless the Mayor later sends an explicit instruction authorizing a repair pass.",
+      "Inspect the actual worktree and its evidence; do not rely only on the polecat's claims.",
+      "Report findings and a ship/fix verdict with polecat_report (state ready); the verdict is recorded on the town ledger.",
+      "Do not broaden scope or make product decisions. Recommend escalation when a real decision is required.",
+    ].join("\n");
+    const thread = await bb.sdk.threads.spawn({
+      projectId: worker.project_id,
+      environment: { type: "reuse", environmentId: live.environmentId },
+      sectionId,
+      visibility: "visible",
+      title,
+      parentThreadId: worker.mayor_thread_id ?? undefined,
+      parentNotifications: "stuck",
+      pluginMetadata: { role: "reviewer", beadId: worker.bead_id, rig: worker.project_id },
+      ...(values.reviewerProvider ? { providerId: values.reviewerProvider as string } : {}),
+      ...(values.reviewerModel ? { model: values.reviewerModel as string } : {}),
+      ...(values.reviewerReasoning ? { reasoningLevel: values.reviewerReasoning as string } : {}),
+      prompt,
+    });
+    insertThread({
+      threadId: thread.id, role: "reviewer", projectId: worker.project_id,
+      mayorThreadId: worker.mayor_thread_id, beadId: worker.bead_id,
+      title, state: "starting", status: thread.status,
+    });
+    db.prepare(`UPDATE town_threads SET worker_thread_id=? WHERE thread_id=?`).run(threadId, thread.id);
+    reloadRoles();
+    publishTown();
+    logEvent("review", `Review started for “${worker.title}”`, thread.id, worker.bead_id);
+    return { threadId: thread.id, title, created: true };
   }
 
   function stateFromLive(row: ManagedRow, status: string) {
@@ -1509,20 +1684,64 @@ export default async function plugin(bb: BbPluginApi) {
   });
   bb.agents.registerTool({
     name: "town_nudge",
-    description: "Send a self-contained instruction to a managed polecat. Steer only to interrupt a thread working something wrong right now.",
+    description: "Send a self-contained instruction to a managed polecat or reviewer. Steer only to interrupt a thread working something wrong right now.",
     parameters: z.object({
       threadId: z.string(),
       text: z.string().trim().min(1).max(MAX_RESULT_LENGTH),
       steer: z.boolean().optional().describe("Interrupt the running turn instead of queuing behind it."),
+      authorizeEdits: z.boolean().optional().describe("For reviewers: explicitly authorize a repair pass (edits allowed) for this instruction."),
     }),
-    async execute({ threadId, text, steer }, context) {
+    async execute({ threadId, text, steer, authorizeEdits }, context) {
       const caller = context.threadId ? roles.get(context.threadId) : undefined;
       const target = roles.get(threadId);
       if (!caller || caller.role !== "mayor" || !target || !belongsToMayor(target, caller.thread_id)) {
         throw new Error(`No managed thread ${threadId} for this Mayor.`);
       }
-      await nudge(threadId, text, steer);
-      return `Nudged ${threadId}${steer ? " (steering the running turn)" : " (queued)"}.`;
+      await nudge(threadId, text, steer, authorizeEdits);
+      return `Nudged ${threadId}${steer ? " (steering the running turn)" : " (queued)"}${authorizeEdits ? " with repair authorization" : ""}.`;
+    },
+  });
+  bb.agents.registerTool({
+    name: "town_review",
+    description: "Start (or return) an independent read-only review of an idle polecat's work, in its own worktree; the verdict lands on the bead.",
+    parameters: z.object({
+      threadId: z.string(),
+      focus: z.string().trim().max(4_000).optional().describe("What the review should concentrate on."),
+    }),
+    async execute({ threadId, focus }, context) {
+      const caller = context.threadId ? roles.get(context.threadId) : undefined;
+      const target = roles.get(threadId);
+      if (!caller || caller.role !== "mayor" || !target || !belongsToMayor(target, caller.thread_id)) {
+        throw new Error(`No managed thread ${threadId} for this Mayor.`);
+      }
+      const review = await startReview(threadId, focus);
+      return `${review.created ? "Started" : "Using existing"} “${review.title}” in thread ${review.threadId}.`;
+    },
+  });
+  bb.agents.registerTool({
+    name: "town_verify",
+    description: "Gather deterministic evidence from a managed thread's worktree: git status, diff stat, and recent log — before deciding to review or land.",
+    parameters: z.object({ threadId: z.string() }),
+    async execute({ threadId }, context) {
+      const caller = context.threadId ? roles.get(context.threadId) : undefined;
+      const target = roles.get(threadId);
+      if (!caller || caller.role !== "mayor" || !target || !belongsToMayor(target, caller.thread_id)) {
+        throw new Error(`No managed thread ${threadId} for this Mayor.`);
+      }
+      return verify(threadId);
+    },
+  });
+  bb.agents.registerTool({
+    name: "town_land",
+    description: "Deliver verified work: commit any uncommitted polecat work, push its branch to the rig's origin, and move the bead to review. The owner alone decides the merge.",
+    parameters: z.object({ threadId: z.string() }),
+    async execute({ threadId }, context) {
+      const caller = context.threadId ? roles.get(context.threadId) : undefined;
+      const target = roles.get(threadId);
+      if (!caller || caller.role !== "mayor" || !target || !belongsToMayor(target, caller.thread_id)) {
+        throw new Error(`No managed thread ${threadId} for this Mayor.`);
+      }
+      return land(threadId);
     },
   });
   bb.agents.registerTool({
@@ -1627,9 +1846,9 @@ export default async function plugin(bb: BbPluginApi) {
     const rules = row ? (rulesCache.get(row.project_id) ?? BUILT_IN_RULES) : BUILT_IN_RULES;
     if (role === "mayor") {
       return {
-        tools: ["town_sling", "town_roster", "town_inspect", "town_nudge", "town_convoy", "town_ready", "town_complete"],
+        tools: ["town_sling", "town_roster", "town_inspect", "town_nudge", "town_convoy", "town_ready", "town_complete", "town_review", "town_verify", "town_land"],
         skills: ["mayor"],
-        instructions: `You are the registered Mayor supervising the town's polecat threads from ${context.project.name}. Decompose goals into convoys (town_convoy), sling beads to polecats (town_sling), and drive work through verified completion (town_complete).\n\n${rules}`,
+        instructions: `You are the registered Mayor supervising the town's polecat threads from ${context.project.name}. Decompose goals into convoys (town_convoy), sling beads to polecats (town_sling), and drive work through verification (town_verify, town_review) and delivery (town_land) to verified completion (town_complete).\n\n${rules}`,
       };
     }
     return {
@@ -1688,8 +1907,11 @@ export default async function plugin(bb: BbPluginApi) {
     "  bb madmax rig remove <project-id>",
     "  bb madmax sling --bead <bead-id> [--rig <project-id>] [--tier <tier>] [--json]",
     "  bb madmax sling --title \"…\" --mission \"…\" [--criteria \"…\"]... [--constraint \"…\"]... [--context \"…\"] [--rig <project-id>] [--tier <tier>] [--json]",
-    "  bb madmax nudge <thread-id> --text \"…\" [--steer] [--json]",
+    "  bb madmax nudge <thread-id> --text \"…\" [--steer] [--authorize-edits] [--json]",
     "  bb madmax inspect <thread-id>",
+    "  bb madmax review <thread-id> [--focus \"…\"] [--json]",
+    "  bb madmax verify <thread-id>",
+    "  bb madmax land <thread-id>",
   ].join("\n");
 
   bb.cli.register({
@@ -1702,8 +1924,11 @@ export default async function plugin(bb: BbPluginApi) {
       { name: "ledger", summary: "Initialize or inspect the town's Beads ledger", usage: "bb madmax ledger init|status [--json]" },
       { name: "rig", summary: "Manage registered rig projects", usage: "bb madmax rig list|add|remove" },
       { name: "sling", summary: "Sling a work item to a polecat", usage: "bb madmax sling --title \"…\" --mission \"…\" [--rig <project-id>] [--tier <tier>] [--json]" },
-      { name: "nudge", summary: "Nudge a managed polecat", usage: "bb madmax nudge <thread-id> --text \"…\" [--steer] [--json]" },
+      { name: "nudge", summary: "Nudge a managed polecat", usage: "bb madmax nudge <thread-id> --text \"…\" [--steer] [--authorize-edits] [--json]" },
       { name: "inspect", summary: "Inspect a managed thread's evidence", usage: "bb madmax inspect <thread-id>" },
+      { name: "review", summary: "Start a read-only review of an idle polecat's work", usage: "bb madmax review <thread-id> [--focus \"…\"] [--json]" },
+      { name: "verify", summary: "Gather git evidence from a managed thread's worktree", usage: "bb madmax verify <thread-id>" },
+      { name: "land", summary: "Deliver: commit, push the branch, bead to review", usage: "bb madmax land <thread-id>" },
     ],
     async run(argv: string[], context: PluginCliContext): Promise<PluginCliResult> {
       const [command, ...rest] = argv;
@@ -1819,8 +2044,24 @@ export default async function plugin(bb: BbPluginApi) {
           const threadId = args.positional[0];
           const text = args.one("text");
           if (!threadId || !text) return fail("nudge requires <thread-id> and --text");
-          await nudge(threadId, text, args.bool("steer"));
+          await nudge(threadId, text, args.bool("steer"), args.bool("authorize-edits"));
           return ok({ threadId }, `Nudged ${threadId}.`);
+        }
+        if (command === "review") {
+          const threadId = args.positional[0];
+          if (!threadId) return fail("review requires <thread-id>");
+          const result = await startReview(threadId, args.one("focus"));
+          return ok(result, `${result.created ? "Started" : "Using existing"} “${result.title}” in ${result.threadId}.`);
+        }
+        if (command === "verify") {
+          const threadId = args.positional[0];
+          if (!threadId) return fail("verify requires <thread-id>");
+          return ok({ threadId }, await verify(threadId));
+        }
+        if (command === "land") {
+          const threadId = args.positional[0];
+          if (!threadId) return fail("land requires <thread-id>");
+          return ok({ threadId }, await land(threadId));
         }
         if (command === "inspect") {
           const threadId = args.positional[0];

@@ -4,7 +4,7 @@
 // a recordable bb.sdk: every spawn, section, project, and send call below is a
 // stub whose arguments the assertions inspect. No BB server is needed.
 import { execFile } from "node:child_process";
-import { mkdtemp } from "node:fs/promises";
+import { mkdtemp, writeFile } from "node:fs/promises";
 import { existsSync } from "node:fs";
 import { homedir, tmpdir } from "node:os";
 import { join, resolve } from "node:path";
@@ -481,6 +481,7 @@ describe.skipIf(!bdAvailable)("madmax ledger (real bd)", () => {
     await plugin(host.bb);
     const dir = await mkdtemp(join(tmpdir(), "madmax-ledger-"));
     await execFileAsync("bd", ["init"], { cwd: dir, timeout: 120_000 });
+    await execFileAsync("bd", ["config", "set", "status.custom", "review"], { cwd: dir, timeout: 60_000 });
     host.harness.inspection.sdk.stub("threadSections.list", () => []);
     host.harness.inspection.sdk.stub("threadSections.create", () => ({ id: "sec_town", name: "Town" }));
     host.harness.inspection.sdk.stub("projects.get", (args: { projectId: string }) => ({
@@ -503,7 +504,7 @@ describe.skipIf(!bdAvailable)("madmax ledger (real bd)", () => {
       makeThreadResponse({ id: `thr_ledger_${counter++}`, status: "starting" }));
     host.harness.inspection.sdk.stub("threads.send", () => ({ ok: true }));
     host.harness.inspection.sdk.stub("threads.get", (args: { threadId: string }) =>
-      makeThreadResponse({ id: args.threadId, status: "idle" }));
+      makeThreadResponse({ id: args.threadId, status: "idle", environmentId: "env_work_1" }));
     await host.harness.behavior.setSettings({ townProject: "proj_town" });
     const started = (await host.harness.behavior.callRpc("start", { projectId: "proj_town" })) as {
       threadId: string;
@@ -666,6 +667,122 @@ describe.skipIf(!bdAvailable)("madmax ledger (real bd)", () => {
     const afterComplete = await bdList(dir);
     const closed = afterComplete.find((issue) => issue.id === bead.id)!;
     expect(closed.status).toBe("closed");
+  });
+
+  /** A real git worktree with a bare origin, a polecat branch, and uncommitted work. */
+  async function makeWorktree() {
+    const worktree = await mkdtemp(join(tmpdir(), "madmax-worktree-"));
+    const origin = await mkdtemp(join(tmpdir(), "madmax-origin-"));
+    const git = (args: string[]) => execFileAsync("git", args, { cwd: worktree, timeout: 30_000 });
+    await execFileAsync("git", ["init", "--bare", "-b", "main", origin], { timeout: 30_000 });
+    await git(["init", "-b", "main"]);
+    await git(["config", "user.email", "town@test"]);
+    await git(["config", "user.name", "Town Test"]);
+    await git(["remote", "add", "origin", origin]);
+    await writeFile(join(worktree, "README.md"), "town\n");
+    await git(["add", "-A"]);
+    await git(["commit", "-m", "init"]);
+    await git(["push", "-u", "origin", "main"]);
+    await git(["checkout", "-b", "bb/polecat-1"]);
+    await writeFile(join(worktree, "fix.txt"), "fixed\n");
+    await git(["add", "-A"]);
+    await git(["commit", "-m", "polecat work"]);
+    await writeFile(join(worktree, "fix.txt"), "fixed\nplus uncommitted polish\n");
+    return { worktree, origin };
+  }
+
+  /** Create a one-bead convoy, sling it, and return the worker's thread id. */
+  async function slingFirstBead(host: Host["host"], dir: string, mayorId: string, title = "Add login endpoint") {
+    await host.harness.behavior.callAgentTool(
+      "town_convoy",
+      { goal: "Ship auth", beads: [{ title, description: "D1: build it." }] },
+      { threadId: mayorId },
+    );
+    const bead = (await bdList(dir)).find((issue) => issue.title === title)!;
+    await host.harness.behavior.callAgentTool(
+      "town_sling",
+      { beadId: bead.id, tier: "small" },
+      { threadId: mayorId },
+    );
+    const status = (await host.harness.behavior.callRpc("status", null)) as {
+      threads: { threadId: string; role: string }[];
+    };
+    return status.threads.find((thread) => thread.role === "polecat")!.threadId;
+  }
+
+  it("town_review commissions a read-only reviewer in the worker's worktree", async () => {
+    const { host, dir, mayorId } = await makeLedgerHost();
+    const polecatId = await slingFirstBead(host, dir, mayorId);
+
+    const review = await host.harness.behavior.callAgentTool(
+      "town_review",
+      { threadId: polecatId, focus: "error handling" },
+      { threadId: mayorId },
+    );
+    expect(String(review)).toContain("Started");
+
+    const spawns = host.harness.inspection.sdk.callsTo("threads.spawn");
+    const reviewerSpawn = spawns[spawns.length - 1]![0] as Record<string, unknown>;
+    expect(reviewerSpawn.environment).toEqual({ type: "reuse", environmentId: "env_work_1" });
+    expect(reviewerSpawn.pluginMetadata).toMatchObject({ role: "reviewer" });
+    expect(reviewerSpawn.title).toBe("Review · Add login endpoint");
+
+    // A second review request dedupes to the existing reviewer.
+    await host.harness.behavior.callAgentTool("town_review", { threadId: polecatId }, { threadId: mayorId });
+    expect(host.harness.inspection.sdk.callsTo("threads.spawn")).toHaveLength(spawns.length);
+
+    // The reviewer is role-gated like a polecat: report tool only.
+    const status = (await host.harness.behavior.callRpc("status", null)) as {
+      threads: { threadId: string; role: string }[];
+    };
+    const reviewer = status.threads.find((thread) => thread.role === "reviewer")!;
+    const configuration = await host.harness.behavior.resolveAgentConfiguration(
+      makePluginAgentConfigurationContext({ thread: { id: reviewer.threadId } }),
+    );
+    expect(configuration.tools.map((tool: { name: string }) => tool.name)).toEqual(["polecat_report"]);
+    expect(configuration.skills).toContain("polecat");
+  });
+
+  it("town_verify gathers evidence; town_land commits, pushes, and moves the bead to review", async () => {
+    const { host, dir, mayorId } = await makeLedgerHost();
+    const { worktree, origin } = await makeWorktree();
+    host.harness.inspection.sdk.stub("environments.get", () => ({
+      id: "env_work_1",
+      path: worktree,
+      branchName: "bb/polecat-1",
+      hostId: "host_1",
+      isGitRepo: true,
+      isWorktree: true,
+      name: null,
+    }));
+    const polecatId = await slingFirstBead(host, dir, mayorId);
+
+    const evidence = String(
+      await host.harness.behavior.callAgentTool("town_verify", { threadId: polecatId }, { threadId: mayorId }),
+    );
+    expect(evidence).toContain("Worktree:");
+    expect(evidence).toContain("bb/polecat-1");
+    expect(evidence).toContain("fix.txt"); // the uncommitted polish shows up
+
+    const landed = String(
+      await host.harness.behavior.callAgentTool("town_land", { threadId: polecatId }, { threadId: mayorId }),
+    );
+    expect(landed).toContain("bb/polecat-1 pushed to origin");
+    expect(landed).toContain("uncommitted polecat work committed");
+
+    // The origin received the branch.
+    const remote = await execFileAsync("git", ["-C", origin, "branch", "--list", "bb/polecat-1"]);
+    expect(remote.stdout.trim()).toBe("bb/polecat-1");
+
+    // The worktree is clean after landing.
+    const clean = await execFileAsync("git", ["-C", worktree, "status", "--porcelain"]);
+    expect(clean.stdout.trim()).toBe("");
+
+    // The bead sits in review with the landing recorded.
+    const issues = await bdList(dir);
+    const bead = issues.find((issue) => issue.title === "Add login endpoint")!;
+    expect(bead.status).toBe("review");
+    expect(bead.comment_count ?? 0).toBeGreaterThan(0);
   });
 
   it("ledgerInit initializes a bare town checkout", async () => {
