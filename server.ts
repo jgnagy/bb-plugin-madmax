@@ -15,6 +15,7 @@
 import { execFile } from "node:child_process";
 import { randomUUID } from "node:crypto";
 import { existsSync } from "node:fs";
+import { appendFile, mkdir, readFile } from "node:fs/promises";
 import { homedir } from "node:os";
 import { join, resolve } from "node:path";
 import { promisify } from "node:util";
@@ -147,6 +148,18 @@ const convoyParams = z.object({
 const completeParams = z.object({
   threadId: z.string().trim().min(1),
   result: z.string().trim().max(MAX_RESULT_LENGTH).optional().describe("The verified outcome recorded on the bead."),
+});
+
+const createRigParams = z.object({
+  gitUrl: z.string().trim().min(1).max(2_000).describe("HTTPS or SSH URL of the repository to clone as a rig."),
+  name: z
+    .string()
+    .trim()
+    .min(1)
+    .max(80)
+    .regex(/^[A-Za-z0-9._-]+$/)
+    .optional()
+    .describe("Rig name; defaults to the repository's name."),
 });
 
 const boardBeadSchema = z.object({
@@ -384,6 +397,11 @@ export default async function plugin(bb: BbPluginApi) {
       default: "accept-edits",
     },
     stallMinutes: { type: "string", label: "Stall threshold (minutes)", default: "30" },
+    rigsDir: {
+      type: "string",
+      label: "Rigs directory (empty = <town>/rigs)",
+      default: "",
+    },
     simplestProvider: { type: "string", label: "Simplest tier — provider (trivial, zero-budget work)", default: "" },
     simplestModel: { type: "string", label: "Simplest tier — model", default: "" },
     simplestReasoning: { type: "select", label: "Simplest tier — reasoning", options: [...reasoningOptions], default: "high" },
@@ -845,6 +863,7 @@ export default async function plugin(bb: BbPluginApi) {
       `You are the Mayor of ${name} — the town's chief-of-staff agent. You coordinate work across the town's registered rig projects through visible polecat threads.`,
       "",
       "Use town_sling to start one polecat per self-contained work item; choose the model tier honestly (simplest for trivial mechanical work, small for lookups and single-file changes, medium for multi-file features, difficult for tricky logic, mostDifficult for adversarial or security-sensitive work).",
+      "When the owner names a repository the town doesn't know, create the rig yourself with town_create_rig (give it the git URL); read GitHub issues with gh in your shell.",
       "Use town_roster for the town's threads. Before deciding, use town_inspect to read a thread's live status, persisted report, and last assistant output. Reports are evidence, not proof — verify with town_verify and commission independent reviews with town_review.",
       "Use town_nudge to answer a polecat's question or correct course; steer only a thread working something wrong right now.",
       "Polecats report ready or blocked; only you decide when work is verified. Land verified work with town_land (branch pushed, bead to review) and mark it complete with town_complete. Escalate to the owner only genuine product decisions, credentials, external accounts, and irreversible actions — lead with a recommendation and the evidence.",
@@ -988,6 +1007,58 @@ export default async function plugin(bb: BbPluginApi) {
     if (result.changes > 0) logEvent("rig", `Rig removed: ${projectId}`);
     publishTown();
     return result.changes > 0;
+  }
+
+  /** Derive a rig name from a git URL: last path segment, minus .git. */
+  function rigNameFromUrl(gitUrl: string): string {
+    const base = gitUrl.replace(/\/+$/, "").split(/[/]/).pop() ?? "";
+    const name = base.replace(/\.git$/i, "");
+    if (!/^[A-Za-z0-9._-]+$/.test(name)) {
+      throw new Error(`Cannot derive a rig name from “${clip(gitUrl, 200)}”; pass a name explicitly.`);
+    }
+    return name;
+  }
+
+  /** Conversational rig onboarding: clone a repo, register it as a rig. */
+  async function createRig(params: z.infer<typeof createRigParams>) {
+    const name = params.name ?? rigNameFromUrl(params.gitUrl);
+    const values = await settings.get();
+    const hostId = await defaultHostId();
+    const configuredDir = ((values.rigsDir as string | undefined) ?? "").trim();
+    const baseDir = configuredDir !== "" ? normalizeTownPath(configuredDir) : join(await townLedgerDir(), "rigs");
+    const target = join(baseDir, name);
+    if (existsSync(target)) {
+      throw new Error(
+        `A folder for rig “${name}” already exists at ${target}. If it is already a bb project, register it with: bb madmax rig add <project-id>`,
+      );
+    }
+    await mkdir(baseDir, { recursive: true });
+    await execFileAsync("git", ["clone", params.gitUrl, target], {
+      timeout: 300_000,
+      maxBuffer: 16 * 1024 * 1024,
+    });
+    // Town-relative rigs stay out of the town repo's status quietly, without
+    // touching the repo's tracked .gitignore (bd --stealth does the same).
+    if (configuredDir === "") {
+      try {
+        const excludePath = join(await townLedgerDir(), ".git", "info", "exclude");
+        if (existsSync(excludePath)) {
+          const current = await readFile(excludePath, "utf8");
+          if (!current.split("\n").includes("rigs/")) {
+            await appendFile(excludePath, `${current.endsWith("\n") ? "" : "\n"}rigs/\n`);
+          }
+        }
+      } catch (error) {
+        bb.log.warn(`Could not update .git/info/exclude for rigs/: ${String(error)}`);
+      }
+    }
+    const project = await bb.sdk.projects.create({
+      name,
+      source: { type: "local_path", hostId, path: target },
+    });
+    await addRig(project.id);
+    logEvent("rig", `Rig cloned: ${name} from ${clip(params.gitUrl, 200)} (${project.id})`);
+    return { projectId: project.id, name, path: target };
   }
 
   function rigProjectForLabel(label: string | undefined): string | null {
@@ -1745,6 +1816,22 @@ export default async function plugin(bb: BbPluginApi) {
     },
   });
   bb.agents.registerTool({
+    name: "town_create_rig",
+    description: "Clone a git repository and register it as a town rig so work can be slung into it. Use when the owner wants to work on a repo the town doesn't know yet.",
+    parameters: createRigParams,
+    async execute(params, context) {
+      const caller = context.threadId ? roles.get(context.threadId) : undefined;
+      if (!caller || caller.role !== "mayor" || ["complete", "archived", "deleted"].includes(caller.state)) {
+        throw new Error("town_create_rig requires an active registered Mayor thread.");
+      }
+      const result = await createRig(params);
+      return [
+        `Rig “${result.name}” is ready (${result.projectId}), cloned to ${result.path}.`,
+        `Sling into it with town_sling rigProjectId=${result.projectId} (or tag beads with the label “${result.name}”).`,
+      ].join("\n");
+    },
+  });
+  bb.agents.registerTool({
     name: "town_convoy",
     description: "Create a convoy (epic) with self-contained beads in the town ledger, ready for slinging.",
     parameters: convoyParams,
@@ -1846,7 +1933,7 @@ export default async function plugin(bb: BbPluginApi) {
     const rules = row ? (rulesCache.get(row.project_id) ?? BUILT_IN_RULES) : BUILT_IN_RULES;
     if (role === "mayor") {
       return {
-        tools: ["town_sling", "town_roster", "town_inspect", "town_nudge", "town_convoy", "town_ready", "town_complete", "town_review", "town_verify", "town_land"],
+        tools: ["town_sling", "town_roster", "town_inspect", "town_nudge", "town_convoy", "town_ready", "town_complete", "town_review", "town_verify", "town_land", "town_create_rig"],
         skills: ["mayor"],
         instructions: `You are the registered Mayor supervising the town's polecat threads from ${context.project.name}. Decompose goals into convoys (town_convoy), sling beads to polecats (town_sling), and drive work through verification (town_verify, town_review) and delivery (town_land) to verified completion (town_complete).\n\n${rules}`,
       };
@@ -1905,6 +1992,7 @@ export default async function plugin(bb: BbPluginApi) {
     "  bb madmax rig list [--json]",
     "  bb madmax rig add <project-id>",
     "  bb madmax rig remove <project-id>",
+    "  bb madmax rig clone <git-url> [--name <name>] [--json]",
     "  bb madmax sling --bead <bead-id> [--rig <project-id>] [--tier <tier>] [--json]",
     "  bb madmax sling --title \"…\" --mission \"…\" [--criteria \"…\"]... [--constraint \"…\"]... [--context \"…\"] [--rig <project-id>] [--tier <tier>] [--json]",
     "  bb madmax nudge <thread-id> --text \"…\" [--steer] [--authorize-edits] [--json]",
@@ -1922,7 +2010,7 @@ export default async function plugin(bb: BbPluginApi) {
       { name: "start", summary: "Start or return the town's Mayor", usage: "bb madmax start [--project <proj-id>] [--json]" },
       { name: "init", summary: "Choose the town project (existing or a new folder) and start the Mayor", usage: "bb madmax init --project <proj-id> | --path <dir> --name <name> [--host <host-id>]" },
       { name: "ledger", summary: "Initialize or inspect the town's Beads ledger", usage: "bb madmax ledger init|status [--json]" },
-      { name: "rig", summary: "Manage registered rig projects", usage: "bb madmax rig list|add|remove" },
+      { name: "rig", summary: "Manage registered rig projects", usage: "bb madmax rig list|add|remove|clone" },
       { name: "sling", summary: "Sling a work item to a polecat", usage: "bb madmax sling --title \"…\" --mission \"…\" [--rig <project-id>] [--tier <tier>] [--json]" },
       { name: "nudge", summary: "Nudge a managed polecat", usage: "bb madmax nudge <thread-id> --text \"…\" [--steer] [--authorize-edits] [--json]" },
       { name: "inspect", summary: "Inspect a managed thread's evidence", usage: "bb madmax inspect <thread-id>" },
@@ -1990,6 +2078,14 @@ export default async function plugin(bb: BbPluginApi) {
             if (!projectId) return fail("rig add requires <project-id>");
             const rig = await addRig(projectId);
             return ok(rig, `Registered rig “${rig.name}” (${rig.projectId}).`);
+          }
+          if (sub === "clone") {
+            const gitUrl = target ?? args.one("url");
+            if (!gitUrl) return fail("rig clone requires <git-url>");
+            const parsed = createRigParams.safeParse({ gitUrl, name: args.one("name") });
+            if (!parsed.success) return fail(`Invalid rig clone request: ${parsed.error.issues[0]?.message ?? "check the arguments"}`);
+            const result = await createRig(parsed.data);
+            return ok(result, `Rig “${result.name}” cloned and registered (${result.projectId}) at ${result.path}.`);
           }
           if (sub === "remove") {
             const projectId = target ?? args.one("project");

@@ -63,6 +63,14 @@ With Phase 3's Town Hall page (problems-first board, roster, activity feed)
 and Phase 2's Beads ledger underneath, the four planned phases are complete:
 madmax is a full Gas Town for bb.
 
+Rigs are conversational, too: tell the Mayor "I'd like to make a PR for
+<github repo> to fix <issue>" and it can bring the repo in itself —
+`town_create_rig` clones the repo into the town's `rigs/` directory
+(quietly excluded from the town repo's status) and registers it as a rig;
+the Mayor reads the issue with `gh` in its shell, slings a bead tagged with
+the rig, and lands the branch when the work verifies. Opening the PR stays
+an owner-approved action, as it should.
+
 Quick start — the town asks where it should live the first time you start it.
 On bb's New Thread screen, the Madmax section offers importing an existing
 project or creating a dedicated folder (recommended); or from the CLI:

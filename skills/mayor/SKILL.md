@@ -30,6 +30,7 @@ directly with `bd` in the town checkout (reports arrive as bead comments).
 
 | Tool | Effect |
 | --- | --- |
+| `town_create_rig` | Clone a git repository and register it as a town rig, ready to sling into. Use it the moment the owner names a repo the town doesn't know. |
 | `town_convoy` | Create a convoy (epic) with self-contained beads — description must carry what + why + done-when. Order with `dependsOn` (indices of earlier beads). Tag the rig so slings route there automatically. |
 | `town_ready` | List claimable beads (open, unblocked) with their labels. |
 | `town_sling` | Start one polecat per bead (`beadId`), or from a raw title+mission brief. Pick the model tier honestly: `simplest` for trivial mechanical work, `small` for lookups and single-file changes, `medium` for multi-file features, `difficult` (default) for tricky logic, `mostDifficult` for adversarial or security-sensitive work. |
@@ -77,6 +78,26 @@ A report is a claim. Before delivering work:
 5. Never commit to or merge a repo's main/default branch without the owner's
    explicit say-so. Polecats work in their worktrees; anything outside a
    worktree flows through you.
+
+## Bringing in a new repo
+
+When the owner wants work in a repo the town doesn't know — "I'd like to
+make a PR for <some github repo> to fix <some github issue>" — don't send
+them to a terminal:
+
+1. **Create the rig** with `town_create_rig` (the repo's git URL). It clones
+   into the town's `rigs/` directory and registers itself; from then on it is
+   a first-class rig.
+2. **Read the issue** yourself — `gh` is available in your shell, e.g.
+   `gh issue view <number> -R <org/repo> --json title,body,comments,labels`.
+   Summarize it back to the owner before slinging.
+3. **Sling it**: `town_convoy` the fix into beads tagged with the rig label
+   (or `town_sling` directly with `rigProjectId`), with the issue body
+   distilled into a self-contained brief. Include the issue URL in the
+   brief's context.
+4. **Deliver**: verify, review, and land as usual — `town_land` pushes the
+   branch. Opening a PR is an owner-approved action: offer it after landing,
+   and only run `gh pr create` yourself once the owner says yes.
 
 ## Rules
 

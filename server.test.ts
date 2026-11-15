@@ -785,6 +785,76 @@ describe.skipIf(!bdAvailable)("madmax ledger (real bd)", () => {
     expect(bead.comment_count ?? 0).toBeGreaterThan(0);
   });
 
+  it("town_create_rig clones a repo, registers it, and slings route into it", async () => {
+    const { host, dir, mayorId } = await makeLedgerHost();
+    const { origin } = await makeWorktree();
+    host.harness.inspection.sdk.stub("projects.create", (args: { name: string }) => ({
+      id: "proj_cloned_rig",
+      name: args.name,
+      kind: "standard",
+      sources: [],
+    }));
+    const rigName = origin.split("/").pop()!;
+
+    // In production the bb project carries the cloned repo's name; mirror
+    // that in the stub so registration and label routing resolve the rig.
+    host.harness.inspection.sdk.stub("projects.get", (args: { projectId: string }) => ({
+      id: args.projectId,
+      name: args.projectId === "proj_cloned_rig" ? rigName : args.projectId === "proj_rig" ? "authify" : "MyTown",
+      kind: "standard",
+      gitRemoteUrl: null,
+      createdAt: 0,
+      updatedAt: 0,
+      sources: [
+        {
+          id: "src_1", projectId: args.projectId, hostId: "host_1",
+          isDefault: true, path: dir, type: "local_path", createdAt: 0, updatedAt: 0,
+        },
+      ],
+    }));
+
+    const result = await host.harness.behavior.callAgentTool(
+      "town_create_rig",
+      { gitUrl: origin },
+      { threadId: mayorId },
+    );
+    expect(String(result)).toContain(`Rig “${rigName}” is ready`);
+
+    // The clone really happened, inside the town's rigs/ directory.
+    const rigPath = join(dir, "rigs", rigName);
+    expect(existsSync(join(rigPath, ".git"))).toBe(true);
+    expect(existsSync(join(rigPath, "README.md"))).toBe(true);
+
+    // It was registered as a bb project from the local path, and as a rig.
+    const createCalls = host.harness.inspection.sdk.callsTo("projects.create");
+    expect(createCalls[createCalls.length - 1]![0]).toMatchObject({
+      name: rigName,
+      source: { type: "local_path", hostId: "host_1", path: rigPath },
+    });
+    const hall = (await host.harness.behavior.callRpc("townHall", null)) as {
+      status: { rigs: { projectId: string }[] };
+      events: { kind: string }[];
+    };
+    expect(hall.status.rigs.some((rig) => rig.projectId === "proj_cloned_rig")).toBe(true);
+    expect(hall.events.some((event) => event.kind === "rig")).toBe(true);
+
+    // And a bead tagged with the rig label routes there automatically.
+    await host.harness.behavior.callAgentTool(
+      "town_convoy",
+      { goal: "Fix the thing", beads: [{ title: "Fix it", description: "D1.", rig: rigName }] },
+      { threadId: mayorId },
+    );
+    const bead = (await bdList(dir)).find((issue) => issue.title === "Fix it")!;
+    await host.harness.behavior.callAgentTool(
+      "town_sling",
+      { beadId: bead.id },
+      { threadId: mayorId },
+    );
+    const spawns = host.harness.inspection.sdk.callsTo("threads.spawn");
+    const slingSpawn = spawns[spawns.length - 1]![0] as Record<string, unknown>;
+    expect(slingSpawn.projectId).toBe("proj_cloned_rig");
+  });
+
   it("ledgerInit initializes a bare town checkout", async () => {
     const host = createFakePluginHost({ pluginId: "madmax", agentSkillIds: ["mayor", "polecat"] });
     hosts.push(host);
