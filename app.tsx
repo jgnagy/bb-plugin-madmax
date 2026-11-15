@@ -204,7 +204,9 @@ function TownOnboarding() {
           </ul>
         )}
         <div className="flex flex-wrap items-center gap-2 border-t border-border pt-3">
-          <span className="text-muted-foreground">Or a new folder:</span>
+          <span className="text-muted-foreground">
+            Or a new town folder (created if missing):
+          </span>
           <Input
             value={name}
             onChange={(event) => setName(event.target.value)}

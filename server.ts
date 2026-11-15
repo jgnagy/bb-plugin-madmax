@@ -13,6 +13,8 @@
 // Conventions adapted from the ghostex "madmax" town skill: GUPP/MEOW/NDI,
 // the brief template, model tiers, escalation, and the never-commit-to-main law.
 import { randomUUID } from "node:crypto";
+import { homedir } from "node:os";
+import { resolve } from "node:path";
 import {
   defineRpcContract,
   type BbPluginApi,
@@ -196,6 +198,30 @@ const BUILT_IN_RULES = `# Town operating rules
 - Absolute law: never commit to or merge a repo's main/default branch without the owner's explicit say-so.
 - Keep thread titles literal and recognizable. Never invent codenames.
 - Do not delete user threads. Mark work complete; let the owner archive it.`;
+
+/** Seeded into a brand-new town folder; never overwrites an existing file. */
+const STARTER_TOWN_MD = `# Town rules
+
+This file is the town's operating rules. The Mayor reads it at startup and
+refreshes it every patrol cycle; every polecat brief carries it. Edit freely.
+
+- Keep thread titles literal and recognizable. Never invent codenames.
+- Escalation flows polecat → Mayor → owner. Bring the owner only genuine
+  product decisions, credentials, external accounts, and irreversible actions.
+- Absolute law: never commit to or merge a repo's main/default branch without
+  the owner's explicit say-so.
+- Polecats work in their own worktrees; anything outside a worktree flows
+  through the Mayor.
+
+(This starter was written by madmax when the town folder was created.)
+`;
+
+/** Absolute, ~-expanded — the plugin server may not share the caller's cwd. */
+function normalizeTownPath(input: string) {
+  if (input === "~") return homedir();
+  if (input.startsWith("~/")) return resolve(homedir(), input.slice(2));
+  return resolve(input);
+}
 
 function parseArgs(argv: string[]) {
   const positional: string[] = [];
@@ -558,12 +584,38 @@ export default async function plugin(bb: BbPluginApi) {
     return ensureMayor(projectId);
   }
 
-  /** First-run flow: register a folder as a new town project and start it. */
+  /** First-run flow: create the town folder on disk, register it, start it. */
   async function createTown(input: { name: string; path: string; hostId?: string }) {
     const hostId = input.hostId ?? (await defaultHostId());
+    const path = normalizeTownPath(input.path);
+    // Bootstrap the folder first — bb registers local paths without checking
+    // they exist, and a town pointing at nothing strands its Mayor.
+    try {
+      await bb.sdk.files.mkdir({ hostId, path, recursive: true });
+    } catch (error) {
+      try {
+        await bb.sdk.files.list({ hostId, path, limit: 1 });
+      } catch {
+        throw error; // the folder truly cannot be created or reached
+      }
+    }
+    let hasRules = true;
+    try {
+      await bb.sdk.files.read({ hostId, path: `${path}/town.md` });
+    } catch {
+      hasRules = false;
+    }
+    if (!hasRules) {
+      await bb.sdk.files.write({
+        hostId,
+        path: `${path}/town.md`,
+        content: STARTER_TOWN_MD,
+        contentEncoding: "utf8",
+      });
+    }
     const project = await bb.sdk.projects.create({
       name: input.name,
-      source: { type: "local_path", hostId, path: input.path },
+      source: { type: "local_path", hostId, path },
     });
     const start = await chooseTown(project.id);
     return { projectId: project.id, threadId: start.threadId, created: start.created };

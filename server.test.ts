@@ -3,6 +3,8 @@
 // The fake host runs the real server.ts with a process-local SQLite store and
 // a recordable bb.sdk: every spawn, section, project, and send call below is a
 // stub whose arguments the assertions inspect. No BB server is needed.
+import { homedir } from "node:os";
+import { resolve } from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
 import {
   createFakePluginHost,
@@ -307,9 +309,14 @@ describe("madmax town backend", () => {
     ).rejects.toThrow(/already set/);
   });
 
-  it("createTown registers a new folder as the town", async () => {
+  it("createTown bootstraps the folder, seeds town.md, and registers it", async () => {
     const host = await makeHost();
     await startTown(host);
+    host.harness.inspection.sdk.stub("files.mkdir", () => ({ ok: true }));
+    host.harness.inspection.sdk.stub("files.read", () => {
+      throw new Error("ENOENT: no such file");
+    });
+    host.harness.inspection.sdk.stub("files.write", () => ({ ok: true }));
     host.harness.inspection.sdk.stub("projects.create", (args: { name: string }) => ({
       id: "proj_new_town",
       name: args.name,
@@ -322,6 +329,15 @@ describe("madmax town backend", () => {
     })) as { projectId: string; threadId: string; created: boolean };
     expect(created.projectId).toBe("proj_new_town");
     expect(created.created).toBe(true);
+
+    const mkdirs = host.harness.inspection.sdk.callsTo("files.mkdir");
+    expect(mkdirs).toHaveLength(1);
+    expect(mkdirs[0]![0]).toMatchObject({ hostId: "host_1", path: "/tmp/town", recursive: true });
+
+    const writes = host.harness.inspection.sdk.callsTo("files.write");
+    expect(writes).toHaveLength(1);
+    expect(writes[0]![0]).toMatchObject({ path: "/tmp/town/town.md", contentEncoding: "utf8" });
+    expect((writes[0]![0] as { content: string }).content).toContain("# Town rules");
 
     const createCalls = host.harness.inspection.sdk.callsTo("projects.create");
     expect(createCalls).toHaveLength(1);
@@ -336,5 +352,36 @@ describe("madmax town backend", () => {
     };
     expect(status.townProjectId).toBe("proj_new_town");
     expect(status.mayor?.threadId).toBe(created.threadId);
+  });
+
+  it("createTown keeps an existing town.md and expands ~ paths", async () => {
+    const host = await makeHost();
+    await startTown(host);
+    host.harness.inspection.sdk.stub("files.mkdir", () => ({ ok: true }));
+    host.harness.inspection.sdk.stub("files.read", () => ({
+      content: "# My own rules",
+      contentEncoding: "utf8",
+    }));
+    host.harness.inspection.sdk.stub("files.write", () => ({ ok: true }));
+    host.harness.inspection.sdk.stub("projects.create", (args: { name: string }) => ({
+      id: "proj_kept_town",
+      name: args.name,
+      kind: "standard",
+      sources: [],
+    }));
+    await host.harness.behavior.callRpc("createTown", {
+      name: "Kept Town",
+      path: "~/towns/kept",
+    });
+
+    // The owner's rules file is never overwritten.
+    expect(host.harness.inspection.sdk.callsTo("files.write")).toHaveLength(0);
+
+    // ~ expands against the server's home, not the caller's cwd.
+    const mkdirs = host.harness.inspection.sdk.callsTo("files.mkdir");
+    expect(mkdirs[0]![0]).toMatchObject({
+      path: resolve(homedir(), "towns/kept"),
+      recursive: true,
+    });
   });
 });
