@@ -9,8 +9,8 @@ below was confirmed against the real declarations, not docs.
 
 | Capability | Verified | madmax use |
 | --- | --- | --- |
-| `threads.spawn` with `environment: { type: "host", workspace: { type: "managed-worktree", baseBranch: { kind: "default" \| "named" } } }` | `createThreadRequestSchema` (L12749) | Polecat hooks; bb owns placement, setup, teardown, cleanup — replaces ghostex's pinned `projects/<name>-<suffix>` placement |
-| `providerId` / `model` / `reasoningLevel` / `serviceTier` / `permissionMode` (`accept-edits` `auto` `full` `workspace-write`) in the spawn call | same | Model tier chosen **at spawn** — no first-turn re-model race (ghostex flaw fixed) |
+| `threads.spawn` with `environment: { type: "host", workspace: { type: "managed-worktree", baseBranch: { kind: "default" \| "named" } } }` | `createThreadRequestSchema` (L12749) | Polecat hooks; bb owns placement, setup, teardown, cleanup — no pinned sibling-directory placement |
+| `providerId` / `model` / `reasoningLevel` / `serviceTier` / `permissionMode` (`accept-edits` `auto` `full` `workspace-write`) in the spawn call | same | Model tier chosen **at spawn** — the post-sling re-model race is structurally impossible |
 | `parentThreadId` + `lifecycleOwnerThreadId` + `parentNotifications: "auto" \| "off" \| "stuck"` | same | bb natively notifies a parent thread when a child is **stuck** — in-band redundancy under our supervisor |
 | `pluginMetadata` on threads, writable via threads API, readable (frozen snapshot) in `PluginAgentConfigurationContext` | L12928, L20759 | Stamp `{ role, beadId, rig, tier }` on every spawned thread; role-gate tools off the same stamp |
 | Events: `thread.created` `.active` `.idle` (with `lastAssistantText`) `.failed` (with `error`) `.archived` **`.unarchived`** `.deleted`, `interaction.pending` | `PluginEvents` map (L19964+) | Deterministic Deacon triggers — no hourly LLM patrol |

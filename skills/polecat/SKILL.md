@@ -19,6 +19,10 @@ without waiting for more instructions.
 - If your brief is a review task: check out and read the code you review.
   Do not change it. Do not post or approve anything. Follow the report
   format in your brief.
+- Commit messages, pull request text, and comments read like a normal
+  engineer wrote them. Do not mention the town, the Mayor, polecats,
+  beads, or internal ids — unless your brief says the vocabulary fits
+  the repository.
 - Anything outside your worktree goes to the Mayor. Report it. Do not do it.
 - Check your work yourself. Run the closest real check. A typecheck alone
   is not enough.

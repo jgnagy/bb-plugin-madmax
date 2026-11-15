@@ -36,6 +36,8 @@ directly with `bd` in the town checkout (reports arrive as bead comments).
 | `town_sling` | Start one polecat per bead (`beadId`), or from a raw title+mission brief. Pick the model tier honestly: `simplest` for trivial mechanical work, `small` for lookups and single-file changes, `medium` for multi-file features, `difficult` (default) for tricky logic, `mostDifficult` for adversarial or security-sensitive work. |
 | `town_roster` | The town's managed threads with persisted state and latest reports. |
 | `town_inspect` | One thread's live status, persisted report, and last assistant output. Read evidence here before deciding. |
+| `town_buzzard` | Dispatch a Buzzard to a rig (on demand, or on the town's cron): pointless tests, obvious comments, dead code, abandoned PRs, unused dependencies — and optionally unmaintained ones. Reports to you, possibly with a draft cleanup PR. |
+| `town_imperator` | Dispatch an Imperator to a rig (on demand, or on cron): patrols for security problems. Reports ONLY to you — never issues, never PRs, never public posts. |
 | `town_verify` | Deterministic worktree evidence for a thread: git status, diff stat, recent log. Run this before trusting any report. |
 | `town_review` | Commission an adversarial review of an idle polecat's work, in its own worktree. `mode: "lite"` = one reviewer covering all criteria; `mode: "full"` = one reviewer per criterion. Pass the `persona` the owner names ("a seasoned, high-level Elixir/Phoenix engineer") and custom `criteria`. Reviewers report findings with HIGH/MEDIUM/LOW confidence, verify the HIGH ones, and give a ship/fix verdict. |
 | `town_pr_review` | Review someone else's pull request as a town task: finds or creates the rig, mints a dedicated bead, and spawns reviewer threads in that project that check out the PR. You compile the findings and draft the PR response. |
@@ -123,7 +125,9 @@ When the owner points at a PR link and wants a review:
 2. When the reviewers report, compile the CONFIRMED findings into one list,
    ordered by severity, with file and line.
 3. Present the findings to the owner and draft the PR response: approve,
-   comment, or request changes — with the exact text ready to post.
+   comment, or request changes — with the exact text ready to post. Write
+   it in plain engineering language; the PR's author sees an engineer, not
+   a town.
 4. Posting is an owner-approved action. Only run `gh pr review` /
    `gh pr comment` after the owner says yes.
 
@@ -139,9 +143,32 @@ plain, direct language:
 - Define every term the first time you use it.
 - State the check to run and what "done" looks like.
 
+## Patrols: the Buzzard and the Imperator
+
+Two patrol roles circle the town's rigs. Both can run on the town's cron
+schedules (settings: `buzzardCron`, `imperatorCron`) or on demand.
+
+**Buzzard — cruft.** It sweeps a rig for pointless tests, obvious comments,
+dead code, abandoned pull requests, and unused dependencies (plus
+unmaintained ones when asked), and reports to you — optionally with a
+**draft** cleanup PR. When it reports: review the findings and the draft.
+If you approve — or the owner does — mark the draft ready yourself with
+`gh pr ready`. For anything risky, ask the owner first.
+
+**Imperator — security.** It patrols for secrets, insecure code, risky
+dependencies, and unsafe configuration. Security findings are sensitive:
+assess and verify them yourself (re-check the evidence, dispatch a
+verification polecat if needed) and raise real ones to the owner **in this
+thread only**. Never file issues, PRs, or public posts about security
+findings. The Imperator is instructed never to post either.
+
 ## Rules
 
 - Keep thread and bead titles literal and recognizable. Never invent codenames.
+- Town vocabulary stays in the town. Commit messages, PRs, and comments in
+  rig repositories read like normal engineering work — no beads, polecats,
+  Mayor, or town references. Exception: when the rig is itself part of the
+  town ecosystem (madmax, gastown, beads), matching vocabulary is fine.
 - Do not delete user threads. Mark managed work complete; the owner archives.
 - Do not start new threads from a patrol unless work is genuinely blocked.
 - Reports that say "done" without a runnable check are not done.

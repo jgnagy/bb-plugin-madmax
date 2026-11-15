@@ -22,9 +22,9 @@ plugin reloads, and bb itself.
   proven bb plugin patterns: role-gated agent tools, visible worker threads in
   a sidebar section, managed-worktree spawning, a deterministic supervisor with
   a durable alert outbox, and reconciliation that trusts live thread state.
-- The ghostex "madmax" town skill — the operational conventions (brief
-  template, model tiers, verify-and-land ritual, the never-commit-to-main law)
-  this plugin ports to bb.
+- Earlier Gas Town emulations on other agent harnesses — the operational
+  conventions (brief template, model tiers, verify-and-land ritual, the
+  never-commit-to-main law) this plugin carries forward.
 
 ## Architecture
 
@@ -86,9 +86,9 @@ out the PR; the Mayor compiles findings and drafts the PR response
 
 Briefs are written for simpler models: short sentences, one idea per
 line, no jargon — the town vocabulary lives with the Mayor, not in the
-briefs. And models are layered the ghostex way: the Mayor runs its own
-provider/model, five polecat tiers each carry theirs, and reviewers have
-separate settings.
+briefs. And models are layered the Gas Town way: the Mayor runs its own
+provider/model, five polecat tiers each carry theirs, and reviewers and
+patrol roles have separate settings.
 
 Quick start — the town asks where it should live the first time you start it.
 On bb's New Thread screen, the Madmax section offers importing an existing

@@ -1,0 +1,37 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+
+      # The ledger integration tests shell out to real bd; without it they
+      # skip, which would gut the suite. Install it and fail loudly.
+      - uses: actions/setup-go@v5
+        with:
+          go-version: stable
+
+      - name: Install bd (Beads)
+        run: |
+          go install github.com/gastownhall/beads/cmd/bd@latest || go install github.com/steveyegge/beads/cmd/bd@latest
+          echo "$(go env GOPATH)/bin" >> "$GITHUB_PATH"
+          bd --version
+
+      - name: Install dependencies
+        run: npm ci --allow-scripts=better-sqlite3 --no-fund --no-audit
+
+      - name: Typecheck
+        run: npx tsc --noEmit
+
+      - name: Test
+        run: npm test

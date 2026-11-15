@@ -594,6 +594,10 @@ describe.skipIf(!bdAvailable)("madmax ledger (real bd)", () => {
     const polecatSpawn = spawns[spawns.length - 1]![0] as Record<string, unknown>;
     expect(polecatSpawn.projectId).toBe("proj_rig");
     expect((polecatSpawn.pluginMetadata as Record<string, unknown>).beadId).toBe(bead.id);
+    // The bead id travels in metadata only — never in the brief text, and
+    // the brief forbids town vocabulary in delivered artifacts.
+    expect(polecatSpawn.prompt).not.toContain(bead.id);
+    expect(polecatSpawn.prompt).toContain("Do not mention the town, the Mayor, polecats, beads, or internal ids");
 
     // The bead is claimed by the town.
     const shown = await bdShow(dir, bead.id);
@@ -788,7 +792,12 @@ describe.skipIf(!bdAvailable)("madmax ledger (real bd)", () => {
       await host.harness.behavior.callAgentTool("town_land", { threadId: polecatId }, { threadId: mayorId }),
     );
     expect(landed).toContain("bb/polecat-1 pushed to origin");
-    expect(landed).toContain("uncommitted polecat work committed");
+    expect(landed).toContain("uncommitted work committed");
+
+    // The commit the town wrote in the rig carries no town vocabulary.
+    const lastCommit = await execFileAsync("git", ["-C", worktree, "log", "-1", "--format=%s"]);
+    expect(lastCommit.stdout.trim()).toBe("Add login endpoint");
+    expect(lastCommit.stdout).not.toMatch(/bead|polecat|mayor|town/i);
 
     // The origin received the branch.
     const remote = await execFileAsync("git", ["-C", origin, "branch", "--list", "bb/polecat-1"]);
@@ -971,6 +980,103 @@ describe.skipIf(!bdAvailable)("madmax ledger (real bd)", () => {
     for (const reviewer of reviewers) {
       expect(reviewer.beadId).toBe(bead.id);
     }
+  });
+
+  it("town_buzzard and town_imperator dispatch patrols with role briefs", async () => {
+    const { host, mayorId } = await makeLedgerHost();
+    await host.harness.behavior.callRpc("rigAdd", { projectId: "proj_rig" });
+
+    const buzzard = await host.harness.behavior.callAgentTool(
+      "town_buzzard",
+      { rigProjectId: "proj_rig", includeUnmaintained: true },
+      { threadId: mayorId },
+    );
+    expect(String(buzzard)).toContain("Buzzard dispatched to authify");
+    let spawns = host.harness.inspection.sdk.callsTo("threads.spawn");
+    const buzzardSpawn = spawns[spawns.length - 1]![0] as Record<string, unknown>;
+    expect(buzzardSpawn.role ?? (buzzardSpawn.pluginMetadata as Record<string, string>).role).toBe("buzzard");
+    let prompt = buzzardSpawn.prompt as string;
+    expect(prompt).toContain("You are a Buzzard");
+    expect(prompt).toContain("gh pr create --draft");
+    expect(prompt).toContain("Never open a ready (non-draft) pull request");
+    expect(prompt).toContain("Unmaintained dependencies");
+
+    const imperator = await host.harness.behavior.callAgentTool(
+      "town_imperator",
+      { rigProjectId: "proj_rig" },
+      { threadId: mayorId },
+    );
+    expect(String(imperator)).toContain("Imperator dispatched");
+    spawns = host.harness.inspection.sdk.callsTo("threads.spawn");
+    const imperatorSpawn = spawns[spawns.length - 1]![0] as Record<string, unknown>;
+    prompt = imperatorSpawn.prompt as string;
+    expect(prompt).toContain("You are an Imperator");
+    expect(prompt).toContain("Do not create issues. Do not create pull requests.");
+    expect(prompt).toContain("Report ONLY to the Mayor");
+
+    // Patrol threads are role-gated like polecats: report tool only.
+    const status = (await host.harness.behavior.callRpc("status", null)) as {
+      threads: { threadId: string; role: string }[];
+    };
+    const imperatorThread = status.threads.find((thread) => thread.role === "imperator")!;
+    const configuration = await host.harness.behavior.resolveAgentConfiguration(
+      makePluginAgentConfigurationContext({ thread: { id: imperatorThread.threadId } }),
+    );
+    expect(configuration.tools.map((tool: { name: string }) => tool.name)).toEqual(["polecat_report"]);
+    expect(configuration.instructions).toContain("Imperator");
+
+    // A second dispatch while the first is active skips instead of piling up.
+    const again = await host.harness.behavior.callAgentTool(
+      "town_imperator",
+      { rigProjectId: "proj_rig" },
+      { threadId: mayorId },
+    );
+    expect(String(again)).toContain("already patrolling");
+    expect(host.harness.inspection.sdk.callsTo("threads.spawn")).toHaveLength(spawns.length);
+  });
+
+  it("scheduled patrol sweeps dispatch one patrol per rig", async () => {
+    const host = createFakePluginHost({
+      pluginId: "madmax",
+      agentSkillIds: ["mayor", "polecat"],
+      settings: { imperatorCron: "0 3 * * *" },
+    });
+    hosts.push(host);
+    await plugin(host.bb);
+    const dir = await mkdtemp(join(tmpdir(), "madmax-patrol-"));
+    await execFileAsync("bd", ["init"], { cwd: dir, timeout: 120_000 });
+    host.harness.inspection.sdk.stub("threadSections.list", () => []);
+    host.harness.inspection.sdk.stub("threadSections.create", () => ({ id: "sec_town", name: "Town" }));
+    host.harness.inspection.sdk.stub("projects.get", (args: { projectId: string }) => ({
+      id: args.projectId,
+      name: args.projectId === "proj_rig" ? "authify" : "MyTown",
+      kind: "standard",
+      gitRemoteUrl: null,
+      createdAt: 0,
+      updatedAt: 0,
+      sources: [
+        {
+          id: "src_1", projectId: args.projectId, hostId: "host_1",
+          isDefault: true, path: dir, type: "local_path", createdAt: 0, updatedAt: 0,
+        },
+      ],
+    }));
+    host.harness.inspection.sdk.stub("hosts.list", () => [{ id: "host_1", status: "connected" }]);
+    let counter = 0;
+    host.harness.inspection.sdk.stub("threads.spawn", () =>
+      makeThreadResponse({ id: `thr_patrol_${counter++}`, status: "starting" }));
+    host.harness.inspection.sdk.stub("threads.send", () => ({ ok: true }));
+    await host.harness.behavior.setSettings({ townProject: "proj_town" });
+    await host.harness.behavior.callRpc("start", { projectId: "proj_town" });
+    await host.harness.behavior.callRpc("rigAdd", { projectId: "proj_rig" });
+
+    await host.harness.behavior.runSchedule("imperator-patrol");
+
+    const spawns = host.harness.inspection.sdk.callsTo("threads.spawn");
+    const patrolSpawns = spawns.map((args) => args[0] as Record<string, unknown>);
+    expect(
+      patrolSpawns.some((spawn) => (spawn.prompt as string).includes("You are an Imperator")),
+    ).toBe(true);
   });
 
   it("ledgerInit initializes a bare town checkout", async () => {

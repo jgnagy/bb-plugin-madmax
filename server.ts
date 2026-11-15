@@ -10,7 +10,7 @@
 // Patterns adapted from Chief for BB (MIT, github.com/divyesh-puri/bb-plugin-chief):
 // role-gated agent tools, visible threads in a sidebar section, managed-worktree
 // spawning, reconciliation that trusts live thread state, and the alert outbox.
-// Conventions adapted from the ghostex "madmax" town skill: GUPP/MEOW/NDI,
+// Conventions carried forward from Gas Town: GUPP/MEOW/NDI,
 // the brief template, model tiers, escalation, and the never-commit-to-main law.
 import { execFile } from "node:child_process";
 import { randomUUID } from "node:crypto";
@@ -39,7 +39,8 @@ const REALTIME_CHANNEL = "town-changed";
 const BD_TIMEOUT_MS = 60_000;
 const LEDGER_CACHE_MS = 5_000;
 
-const roleSchema = z.enum(["mayor", "polecat", "reviewer"]);
+const roleSchema = z.enum(["mayor", "polecat", "reviewer", "buzzard", "imperator"]);
+type PatrolRole = "buzzard" | "imperator";
 const stateSchema = z.enum([
   "starting",
   "pending",
@@ -411,6 +412,15 @@ export default async function plugin(bb: BbPluginApi) {
     reviewerProvider: { type: "string", label: "Reviewer provider", default: "" },
     reviewerModel: { type: "string", label: "Reviewer model", default: "" },
     reviewerReasoning: { type: "select", label: "Reviewer reasoning", options: [...reasoningOptions], default: "high" },
+    buzzardProvider: { type: "string", label: "Buzzard provider", default: "" },
+    buzzardModel: { type: "string", label: "Buzzard model", default: "" },
+    buzzardReasoning: { type: "select", label: "Buzzard reasoning", options: [...reasoningOptions], default: "high" },
+    imperatorProvider: { type: "string", label: "Imperator provider", default: "" },
+    imperatorModel: { type: "string", label: "Imperator model", default: "" },
+    imperatorReasoning: { type: "select", label: "Imperator reasoning", options: [...reasoningOptions], default: "high" },
+    buzzardCron: { type: "string", label: "Buzzard sweep schedule (cron, empty = off; reload after change)", default: "" },
+    imperatorCron: { type: "string", label: "Imperator security patrol schedule (cron, empty = off; reload after change)", default: "" },
+    buzzardUnmaintained: { type: "boolean", label: "Buzzard also flags unmaintained dependencies", default: false },
     polecatPermissionMode: {
       type: "select",
       label: "Polecat permission mode",
@@ -489,6 +499,32 @@ export default async function plugin(bb: BbPluginApi) {
       bead_id TEXT
     )`,
     `ALTER TABLE town_threads ADD COLUMN worker_thread_id TEXT`,
+    `CREATE TABLE IF NOT EXISTS town_threads_v2 (
+      thread_id TEXT PRIMARY KEY,
+      role TEXT NOT NULL CHECK(role IN ('mayor','polecat','reviewer','buzzard','imperator')),
+      project_id TEXT NOT NULL,
+      mayor_thread_id TEXT,
+      worker_thread_id TEXT,
+      bead_id TEXT,
+      tier TEXT,
+      title TEXT NOT NULL,
+      state TEXT NOT NULL,
+      status TEXT,
+      result TEXT,
+      blocker TEXT,
+      recommendation TEXT,
+      active_since INTEGER,
+      active_cycle INTEGER NOT NULL DEFAULT 0,
+      stall_alerted_cycle INTEGER,
+      created_at INTEGER NOT NULL,
+      updated_at INTEGER NOT NULL
+    )`,
+    `INSERT INTO town_threads_v2 (thread_id, role, project_id, mayor_thread_id, worker_thread_id, bead_id, tier, title, state, status, result, blocker, recommendation, active_since, active_cycle, stall_alerted_cycle, created_at, updated_at)
+      SELECT thread_id, role, project_id, mayor_thread_id, worker_thread_id, bead_id, tier, title, state, status, result, blocker, recommendation, active_since, active_cycle, stall_alerted_cycle, created_at, updated_at FROM town_threads`,
+    `DROP TABLE town_threads`,
+    `ALTER TABLE town_threads_v2 RENAME TO town_threads`,
+    `CREATE INDEX IF NOT EXISTS town_threads_mayor ON town_threads (mayor_thread_id, created_at)`,
+    `CREATE INDEX IF NOT EXISTS town_threads_project ON town_threads (project_id, created_at)`,
   ]);
 
   const allRows = db.prepare(`SELECT * FROM town_threads ORDER BY created_at ASC`);
@@ -1135,7 +1171,7 @@ export default async function plugin(bb: BbPluginApi) {
       `You are a polecat. You work for the town of ${townName}. Your work area is rig ${rigName}.`,
       "",
       "## Task",
-      bead ? `${title} (bead ${bead.id} in the town ledger)` : title,
+      title,
       "",
       "## Goal",
       mission,
@@ -1152,7 +1188,7 @@ export default async function plugin(bb: BbPluginApi) {
             "## Pull request",
             "- The owner approved opening a pull request for this task.",
             "- When your changes are done: commit your work on your branch, push the branch (git push -u origin HEAD), then create the pull request (gh pr create).",
-            "- Write a clear pull request title and a short description.",
+            "- Write the pull request title and description in plain engineering language. No internal vocabulary.",
             "- Put the pull request URL in your final report.",
           ]
         : []),
@@ -1164,6 +1200,7 @@ export default async function plugin(bb: BbPluginApi) {
       "- Do not push, merge, or delete anything, unless this task says so.",
       "- Do not post comments or reviews to external services.",
       "- Do not open a pull request, unless this task says the owner approved it.",
+      "- Commit messages, pull request text, and comments read like a normal engineer wrote them. Do not mention the town, the Mayor, polecats, beads, or internal ids — unless this task says the vocabulary fits this repository.",
       "- Anything outside your worktree goes to the Mayor. Report it. Do not do it.",
       "- Check your work yourself. Run the closest real check. A typecheck alone is not enough.",
       "",
@@ -1459,8 +1496,9 @@ export default async function plugin(bb: BbPluginApi) {
     let commitNote = "no uncommitted changes";
     if (changes.trim() !== "") {
       await runGit(path, ["add", "-A"]);
-      await runGit(path, ["commit", "-m", `polecat work: ${row.title}${row.bead_id ? ` (bead ${row.bead_id})` : ""}`]);
-      commitNote = "uncommitted polecat work committed";
+      // Artifacts in rigs carry no town vocabulary — a commit is just a commit.
+      await runGit(path, ["commit", "-m", clip(row.title, 100)]);
+      commitNote = "uncommitted work committed";
     }
     await runGit(path, ["push", "-u", "origin", "HEAD"]);
     const pushedBranch = branchName ?? "HEAD";
@@ -1709,6 +1747,174 @@ export default async function plugin(bb: BbPluginApi) {
     return { beadId, pr: prLabel, reviewers, created: true };
   }
 
+  // ── Patrol roles: the Buzzard (cruft) and the Imperator (security) ──
+
+  function patrolSettingsPrefix(role: PatrolRole) {
+    return role === "buzzard" ? "buzzard" : "imperator";
+  }
+
+  function buzzardBrief(rigName: string, includeUnmaintained: boolean): string {
+    return [
+      `You are a Buzzard. You circle a repository and pick it clean.`,
+      `Repository: ${rigName}. Work in your worktree.`,
+      "",
+      "Look for:",
+      "1. Pointless tests. Tests that assert nothing real.",
+      "2. Obvious comments. Comments that only repeat the code next to them.",
+      "3. Dead code. Code nothing calls. Old paths. Unused exports.",
+      "4. Abandoned pull requests. Check: gh pr list --state open --json number,title,isDraft,updatedAt. Flag drafts and stale PRs with no activity.",
+      "5. Unused dependencies. Use the project's own tooling when it has one (for example knip or depcheck for JavaScript, mix xref or unused for Elixir).",
+      ...(includeUnmaintained
+        ? [
+            "6. Unmaintained dependencies. Check each dependency's health: last release, last commit, archived status. Name a better-maintained alternative when one exists.",
+          ]
+        : []),
+      "",
+      "Rules:",
+      "- Report every finding. Give the file, or the PR link.",
+      "- You may open ONE draft pull request for safe removals (dead code, obvious comments, unused dependencies). Use: gh pr create --draft.",
+      "- The draft PR title and description must read like a normal cleanup PR. No internal vocabulary.",
+      "- Never open a ready (non-draft) pull request. The Mayor decides when a draft goes ready.",
+      "- Do not post comments or reviews on other people's pull requests.",
+      "- Do not delete anything outside your worktree.",
+      "",
+      "Report:",
+      "- Use polecat_report with state ready.",
+      "- List each finding with its evidence.",
+      "- Put the draft PR link in the report, if you made one.",
+      "- Recommend an action per finding: remove, fix, or leave with a reason.",
+    ].join("\n");
+  }
+
+  function imperatorBrief(rigName: string): string {
+    return [
+      `You are an Imperator. You patrol a repository for security problems.`,
+      `Repository: ${rigName}. Work in your worktree.`,
+      "",
+      "Look for:",
+      "1. Secrets in the code. Keys, tokens, passwords, credentials in files or history.",
+      "2. Insecure code. Injection, unsafe deserialization, weak crypto, broken access control.",
+      "3. Risky dependencies. Check for known advisories (osv.dev, GitHub advisories).",
+      "4. Unsafe configuration. Debug flags, open ports, permissive permissions.",
+      "",
+      "Rules:",
+      "- This is a security patrol. Report ONLY to the Mayor.",
+      "- Do not create issues. Do not create pull requests. Do not post anything anywhere.",
+      "- Do not change code. Do not push. Do not open draft pull requests.",
+      "",
+      "Report:",
+      "- Use polecat_report with state ready.",
+      "- Give each finding: severity (critical, high, medium, low), confidence (HIGH, MEDIUM, LOW), file and line, evidence.",
+      "- Say clearly what an attacker could do, if the finding is real.",
+    ].join("\n");
+  }
+
+  async function resolvePatrolTarget(params: { rigProjectId?: string; gitUrl?: string }): Promise<{
+    projectId: string;
+    name: string;
+  }> {
+    if (params.rigProjectId) {
+      if (!isRig(params.rigProjectId)) {
+        throw new Error(`Project ${params.rigProjectId} is not a registered rig. Register it first: bb madmax rig add ${params.rigProjectId}`);
+      }
+      const row = rigById.get(params.rigProjectId) as RigRow;
+      return { projectId: row.project_id, name: row.name };
+    }
+    if (params.gitUrl) {
+      const derived = rigNameFromUrl(params.gitUrl);
+      const known = (allRigs.all() as RigRow[]).find((row) => row.name === derived);
+      if (known) return { projectId: known.project_id, name: known.name };
+      const created = await createRig({ gitUrl: params.gitUrl });
+      return { projectId: created.projectId, name: created.name };
+    }
+    throw new Error("Give the patrol a target: rigProjectId of a registered rig, or gitUrl to find or create one.");
+  }
+
+  function patrolActive(role: PatrolRole, projectId: string): boolean {
+    return [...roles.values()].some(
+      (row) =>
+        row.role === role &&
+        row.project_id === projectId &&
+        !["complete", "archived", "deleted", "failed", "blocked", "ready", "idle"].includes(row.state),
+    );
+  }
+
+  async function dispatchPatrol(
+    role: PatrolRole,
+    options: { rigProjectId?: string; gitUrl?: string; includeUnmaintained?: boolean; reason: "schedule" | "demand" },
+  ) {
+    if (!mayorRow()) {
+      throw new Error("No Mayor thread is running; start the Mayor first (bb madmax start).");
+    }
+    const target = await resolvePatrolTarget(options);
+    if (patrolActive(role, target.projectId)) {
+      return { skipped: true as const, projectId: target.projectId, name: target.name };
+    }
+    const values = await settings.get();
+    const prefix = patrolSettingsPrefix(role);
+    const sectionId = await ensureSection();
+    const hostId = await defaultHostId();
+    const title = `${role === "buzzard" ? "Buzzard" : "Imperator"} · ${target.name}`;
+    const prompt =
+      role === "buzzard"
+        ? buzzardBrief(target.name, options.includeUnmaintained ?? (values.buzzardUnmaintained as boolean))
+        : imperatorBrief(target.name);
+    const thread = await bb.sdk.threads.spawn({
+      projectId: target.projectId,
+      environment: {
+        type: "host",
+        hostId,
+        workspace: { type: "managed-worktree", baseBranch: { kind: "default" } },
+      },
+      sectionId,
+      visibility: "visible",
+      title,
+      parentThreadId: mayorRow()?.thread_id ?? undefined,
+      parentNotifications: "stuck",
+      pluginMetadata: { role, rig: target.projectId },
+      permissionMode: (values.polecatPermissionMode as SpawnPermissionMode) || "accept-edits",
+      ...(values[`${prefix}Provider`] ? { providerId: values[`${prefix}Provider`] as string } : {}),
+      ...(values[`${prefix}Model`] ? { model: values[`${prefix}Model`] as string } : {}),
+      ...(values[`${prefix}Reasoning`] ? { reasoningLevel: values[`${prefix}Reasoning`] as string } : {}),
+      prompt,
+    });
+    insertThread({
+      threadId: thread.id, role, projectId: target.projectId,
+      mayorThreadId: mayorRow()?.thread_id ?? null, title,
+      state: "starting", status: thread.status,
+    });
+    logEvent(
+      "patrol",
+      `${role === "buzzard" ? "Buzzard" : "Imperator"} dispatched to ${target.name} (${options.reason})`,
+      thread.id,
+    );
+    return { skipped: false as const, threadId: thread.id, title, projectId: target.projectId, name: target.name };
+  }
+
+  /** Scheduled sweeps: one patrol per registered rig, skipping active ones. */
+  async function runPatrolSweep(role: PatrolRole, includeUnmaintained?: boolean): Promise<void> {
+    const rigs = allRigs.all() as RigRow[];
+    const dispatched: string[] = [];
+    const skipped: string[] = [];
+    for (const rig of rigs) {
+      const result = await dispatchPatrol(role, {
+        rigProjectId: rig.project_id,
+        includeUnmaintained,
+        reason: "schedule",
+      }).catch((error) => {
+        bb.log.warn(`Scheduled ${role} sweep failed for ${rig.name}: ${String(error)}`);
+        return null;
+      });
+      if (result === null) continue;
+      if (result.skipped) skipped.push(rig.name);
+      else dispatched.push(rig.name);
+    }
+    logEvent(
+      "patrol",
+      `${role} sweep: ${dispatched.length} dispatched${skipped.length ? `, ${skipped.length} skipped (already active)` : ""}`,
+    );
+  }
+
   function stateFromLive(row: ManagedRow, status: string) {
     if (["active", "starting", "pending", "stopping"].includes(status)) return status;
     if (status === "error") return "failed";
@@ -1896,6 +2102,26 @@ export default async function plugin(bb: BbPluginApi) {
       void ensureMayor(next.townProject as string).catch((error) => bb.log.warn(`Could not auto-start the Mayor: ${String(error)}`));
     }
   });
+
+  // Scheduled patrols (settings are read once per load; reload the plugin
+  // after changing a patrol cron).
+  const patrolValues = await settings.get();
+  const buzzardCron = ((patrolValues.buzzardCron as string | undefined) ?? "").trim();
+  if (buzzardCron !== "") {
+    try {
+      bb.background.schedule("buzzard-sweep", buzzardCron, () => runPatrolSweep("buzzard"));
+    } catch (error) {
+      bb.log.warn(`Buzzard schedule not registered: ${String(error)}`);
+    }
+  }
+  const imperatorCron = ((patrolValues.imperatorCron as string | undefined) ?? "").trim();
+  if (imperatorCron !== "") {
+    try {
+      bb.background.schedule("imperator-patrol", imperatorCron, () => runPatrolSweep("imperator"));
+    } catch (error) {
+      bb.log.warn(`Imperator schedule not registered: ${String(error)}`);
+    }
+  }
 
   function belongsToMayor(row: ManagedRow, mayorThreadId: string) {
     return row.thread_id === mayorThreadId || row.mayor_thread_id === mayorThreadId;
@@ -2148,6 +2374,52 @@ export default async function plugin(bb: BbPluginApi) {
     },
   });
 
+  bb.agents.registerTool({
+    name: "town_buzzard",
+    description: "Dispatch a Buzzard to a rig on demand: it circles the repo for pointless tests, obvious comments, dead code, abandoned PRs, and unused dependencies (optionally unmaintained ones), and reports to you with an optional draft cleanup PR.",
+    parameters: z.object({
+      rigProjectId: z.string().trim().min(1).optional().describe("Registered rig project to sweep."),
+      gitUrl: z.string().trim().min(1).max(2_000).optional().describe("Repository URL; finds or creates the rig."),
+      includeUnmaintained: z.boolean().optional().describe("Also flag unmaintained dependencies and better-maintained alternatives."),
+    }),
+    async execute(params, context) {
+      const caller = context.threadId ? roles.get(context.threadId) : undefined;
+      if (!caller || caller.role !== "mayor" || ["complete", "archived", "deleted"].includes(caller.state)) {
+        throw new Error("town_buzzard requires an active registered Mayor thread.");
+      }
+      const result = await dispatchPatrol("buzzard", { ...params, reason: "demand" });
+      if (result.skipped) {
+        return `A Buzzard is already circling ${result.name}; it will report when done.`;
+      }
+      return [
+        `Buzzard dispatched to ${result.name} (thread ${result.threadId}).`,
+        "When it reports: review the findings. If it made a draft PR, approve or reject it. On approval, mark it ready (gh pr ready) yourself — or ask the owner first for anything risky.",
+      ].join("\n");
+    },
+  });
+  bb.agents.registerTool({
+    name: "town_imperator",
+    description: "Dispatch an Imperator to a rig on demand: it patrols for security problems (secrets, insecure code, risky dependencies, unsafe configuration) and reports ONLY to you. It never posts findings externally.",
+    parameters: z.object({
+      rigProjectId: z.string().trim().min(1).optional().describe("Registered rig project to patrol."),
+      gitUrl: z.string().trim().min(1).max(2_000).optional().describe("Repository URL; finds or creates the rig."),
+    }),
+    async execute(params, context) {
+      const caller = context.threadId ? roles.get(context.threadId) : undefined;
+      if (!caller || caller.role !== "mayor" || ["complete", "archived", "deleted"].includes(caller.state)) {
+        throw new Error("town_imperator requires an active registered Mayor thread.");
+      }
+      const result = await dispatchPatrol("imperator", { ...params, reason: "demand" });
+      if (result.skipped) {
+        return `An Imperator is already patrolling ${result.name}; it will report when done.`;
+      }
+      return [
+        `Imperator dispatched to ${result.name} (thread ${result.threadId}).`,
+        "When it reports: assess and verify the findings yourself before raising anything to the owner. Security findings go to the owner in this thread only — never as public issues or PRs.",
+      ].join("\n");
+    },
+  });
+
   bb.agents.configure((context) => {
     const row = roles.get(context.thread.id);
     const role = row?.role ?? (context.pluginMetadata.role === "mayor" || context.pluginMetadata.role === "polecat" || context.pluginMetadata.role === "reviewer"
@@ -2159,9 +2431,23 @@ export default async function plugin(bb: BbPluginApi) {
     const rules = row ? (rulesCache.get(row.project_id) ?? BUILT_IN_RULES) : BUILT_IN_RULES;
     if (role === "mayor") {
       return {
-        tools: ["town_sling", "town_roster", "town_inspect", "town_nudge", "town_convoy", "town_ready", "town_complete", "town_review", "town_verify", "town_land", "town_create_rig", "town_pr_review"],
+        tools: ["town_sling", "town_roster", "town_inspect", "town_nudge", "town_convoy", "town_ready", "town_complete", "town_review", "town_verify", "town_land", "town_create_rig", "town_pr_review", "town_buzzard", "town_imperator"],
         skills: ["mayor"],
         instructions: `You are the registered Mayor supervising the town's polecat threads from ${context.project.name}. Decompose goals into convoys (town_convoy), sling beads to polecats (town_sling), and drive work through verification (town_verify, town_review) and delivery (town_land) to verified completion (town_complete).\n\n${rules}`,
+      };
+    }
+    if (role === "buzzard") {
+      return {
+        tools: ["polecat_report"],
+        skills: ["polecat"],
+        instructions: `You are the town's Buzzard: circle the repo, pick it clean, and report to the Mayor. Cleanup pull requests stay drafts until the Mayor or the owner approves them.\n\n${rules}`,
+      };
+    }
+    if (role === "imperator") {
+      return {
+        tools: ["polecat_report"],
+        skills: ["polecat"],
+        instructions: `You are the town's Imperator: patrol for security problems. Report ONLY to the Mayor in this thread; never create issues, PRs, or public posts about security findings.\n\n${rules}`,
       };
     }
     return {
@@ -2226,6 +2512,10 @@ export default async function plugin(bb: BbPluginApi) {
     "  bb madmax review <thread-id> [--focus \"…\"] [--mode lite|full] [--json]",
     "  bb madmax verify <thread-id>",
     "  bb madmax land <thread-id>",
+    "  bb madmax buzzard --rig <project-id> [--unmaintained] [--json]",
+    "  bb madmax buzzard --git-url <url> [--unmaintained] [--json]",
+    "  bb madmax imperator --rig <project-id> [--json]",
+    "  bb madmax imperator --git-url <url> [--json]",
   ].join("\n");
 
   bb.cli.register({
@@ -2243,6 +2533,8 @@ export default async function plugin(bb: BbPluginApi) {
       { name: "review", summary: "Start an adversarial review of an idle polecat's work", usage: "bb madmax review <thread-id> [--focus \"…\"] [--mode lite|full] [--json]" },
       { name: "verify", summary: "Gather git evidence from a managed thread's worktree", usage: "bb madmax verify <thread-id>" },
       { name: "land", summary: "Deliver: commit, push the branch, bead to review", usage: "bb madmax land <thread-id>" },
+      { name: "buzzard", summary: "Dispatch a Buzzard cruft sweep to a rig", usage: "bb madmax buzzard --rig <project-id> | --git-url <url> [--unmaintained] [--json]" },
+      { name: "imperator", summary: "Dispatch an Imperator security patrol to a rig", usage: "bb madmax imperator --rig <project-id> | --git-url <url> [--json]" },
     ],
     async run(argv: string[], context: PluginCliContext): Promise<PluginCliResult> {
       const [command, ...rest] = argv;
@@ -2389,6 +2681,22 @@ export default async function plugin(bb: BbPluginApi) {
           const threadId = args.positional[0];
           if (!threadId) return fail("land requires <thread-id>");
           return ok({ threadId }, await land(threadId));
+        }
+        if (command === "buzzard" || command === "imperator") {
+          const rigProjectId = args.one("rig");
+          const gitUrl = args.one("git-url");
+          if (!rigProjectId && !gitUrl) return fail(`${command} requires --rig <project-id> or --git-url <url>`);
+          await ensureMayor();
+          const result = await dispatchPatrol(command, {
+            ...(rigProjectId ? { rigProjectId } : {}),
+            ...(gitUrl ? { gitUrl } : {}),
+            ...(command === "buzzard" ? { includeUnmaintained: args.bool("unmaintained") } : {}),
+            reason: "demand",
+          });
+          if (result.skipped) {
+            return ok(result, `A patrol is already active for ${result.name}; it will report when done.`);
+          }
+          return ok(result, `${command === "buzzard" ? "Buzzard" : "Imperator"} dispatched to ${result.projectId} (thread ${result.threadId}).`);
         }
         if (command === "inspect") {
           const threadId = args.positional[0];
