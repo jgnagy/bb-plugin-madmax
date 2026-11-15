@@ -37,7 +37,8 @@ directly with `bd` in the town checkout (reports arrive as bead comments).
 | `town_roster` | The town's managed threads with persisted state and latest reports. |
 | `town_inspect` | One thread's live status, persisted report, and last assistant output. Read evidence here before deciding. |
 | `town_verify` | Deterministic worktree evidence for a thread: git status, diff stat, recent log. Run this before trusting any report. |
-| `town_review` | Commission an independent, read-only reviewer thread in the polecat's own worktree (idle polecats only). The ship/fix verdict lands on the bead. |
+| `town_review` | Commission an adversarial review of an idle polecat's work, in its own worktree. `mode: "lite"` = one reviewer covering all criteria; `mode: "full"` = one reviewer per criterion. Pass the `persona` the owner names ("a seasoned, high-level Elixir/Phoenix engineer") and custom `criteria`. Reviewers report findings with HIGH/MEDIUM/LOW confidence, verify the HIGH ones, and give a ship/fix verdict. |
+| `town_pr_review` | Review someone else's pull request as a town task: finds or creates the rig, mints a dedicated bead, and spawns reviewer threads in that project that check out the PR. You compile the findings and draft the PR response. |
 | `town_land` | Deliver verified work: commit any uncommitted polecat work, push its branch to the rig's origin, move the bead to review. The owner alone decides the merge. |
 | `town_nudge` | Send a self-contained instruction. Use `steer: true` only to interrupt a thread working something wrong right now; otherwise let it queue. Reviewers stay read-only unless you pass `authorizeEdits: true`. |
 | `town_complete` | Mark a thread complete after verifying its evidence; closes the linked bead in the ledger. |
@@ -62,9 +63,16 @@ A report is a claim. Before delivering work:
 1. **Verify** — `town_verify` gathers deterministic git evidence from the
    worktree (status, diff, log). A report that says "done" without a runnable
    check is not done.
-2. **Review** — for meaningful or risky changes, `town_review` an independent
-   read-only reviewer in the polecat's worktree. Weigh its ship/fix verdict
-   (recorded on the bead) with the evidence.
+2. **Review** — for meaningful or risky changes, `town_review` adversarially:
+   `mode: "lite"` for one reviewer, `mode: "full"` for one reviewer per
+   criterion. Pass the persona the owner names ("a seasoned, high-level
+   Elixir/Phoenix software engineer") and their criteria (security,
+   maintainability, performance, quality by default). Reviewers report
+   findings with confidence ratings and verify the HIGH ones. Nudge the
+   worker with the CONFIRMED findings, let it fix them, and repeat the
+   review until the verdict is ship — and CI is green where the project has
+   it. Review findings land on the bead; they improve the work before it is
+   claimed done.
 3. **Land** — `town_land` commits any uncommitted work, pushes the branch to
    the rig's origin, and moves the bead to review. Pushing a work branch is
    part of delivery; merges, PRs, and default branches wait for the owner —
@@ -91,13 +99,45 @@ them to a terminal:
 2. **Read the issue** yourself — `gh` is available in your shell, e.g.
    `gh issue view <number> -R <org/repo> --json title,body,comments,labels`.
    Summarize it back to the owner before slinging.
-3. **Sling it**: `town_convoy` the fix into beads tagged with the rig label
+3. **Ask about the PR first.** Opening a pull request touches an external
+   service. Ask the owner: "When the work verifies, I'll open a PR —
+   approved?" If yes, sling with `openPr: true` — the approval travels in
+   the brief and the polecat pushes its branch and runs `gh pr create`
+   itself.
+4. **Sling it**: `town_convoy` the fix into beads tagged with the rig label
    (or `town_sling` directly with `rigProjectId`), with the issue body
    distilled into a self-contained brief. Include the issue URL in the
    brief's context.
-4. **Deliver**: verify, review, and land as usual — `town_land` pushes the
-   branch. Opening a PR is an owner-approved action: offer it after landing,
-   and only run `gh pr create` yourself once the owner says yes.
+5. **Deliver**: verify, review, and land as usual — `town_land` moves the
+   bead to review. If the polecat already opened the PR, its report carries
+   the URL.
+
+## Reviewing someone else's pull request
+
+When the owner points at a PR link and wants a review:
+
+1. Call `town_pr_review` with the repository's gitUrl and the PR number
+   (`mode: "lite"` or `"full"`, plus the owner's `persona` and `criteria`).
+   It finds or creates the rig, mints a dedicated bead, and spawns reviewer
+   threads that check out the PR.
+2. When the reviewers report, compile the CONFIRMED findings into one list,
+   ordered by severity, with file and line.
+3. Present the findings to the owner and draft the PR response: approve,
+   comment, or request changes — with the exact text ready to post.
+4. Posting is an owner-approved action. Only run `gh pr review` /
+   `gh pr comment` after the owner says yes.
+
+## Brief style: write for simpler models
+
+Polecats may run smaller models than you. Write every brief and nudge in
+plain, direct language:
+
+- Short sentences. One idea per line. Active voice.
+- Everyday words. No idioms, no metaphors, no town jargon (GUPP/MEOW/NDI are
+  for you, not for them).
+- Say exactly what to do, in order, and exactly what to report.
+- Define every term the first time you use it.
+- State the check to run and what "done" looks like.
 
 ## Rules
 

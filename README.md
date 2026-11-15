@@ -68,8 +68,27 @@ Rigs are conversational, too: tell the Mayor "I'd like to make a PR for
 `town_create_rig` clones the repo into the town's `rigs/` directory
 (quietly excluded from the town repo's status) and registers it as a rig;
 the Mayor reads the issue with `gh` in its shell, slings a bead tagged with
-the rig, and lands the branch when the work verifies. Opening the PR stays
-an owner-approved action, as it should.
+the rig, and lands the branch when the work verifies. Opening the PR is
+owner-approved at dispatch and travels in the polecat's brief (`openPr:
+true`).
+
+Reviews are adversarial and structured. `town_review` commissions deep
+reviews of a polecat's work before it lands: lite mode (one reviewer) or
+full mode (one reviewer per criterion — security, maintainability,
+performance, quality, or your own), each working as a persona you name.
+Every review runs three phases — findings with HIGH/MEDIUM/LOW confidence,
+verification of the HIGH findings, then a compiled ship/fix verdict — and
+the Mayor drives the fix loop until the verdict is clean. `town_pr_review`
+reviews *someone else's* pull request the same way: it finds or creates
+the rig, mints a dedicated bead, and spawns reviewer threads that check
+out the PR; the Mayor compiles findings and drafts the PR response
+(approve, comment, request changes) — the owner decides whether to post.
+
+Briefs are written for simpler models: short sentences, one idea per
+line, no jargon — the town vocabulary lives with the Mayor, not in the
+briefs. And models are layered the ghostex way: the Mayor runs its own
+provider/model, five polecat tiers each carry theirs, and reviewers have
+separate settings.
 
 Quick start — the town asks where it should live the first time you start it.
 On bb's New Thread screen, the Madmax section offers importing an existing

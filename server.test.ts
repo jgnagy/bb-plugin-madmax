@@ -96,6 +96,25 @@ describe("madmax town backend", () => {
     );
   });
 
+  it("slings with owner-approved PR authorization in the brief", async () => {
+    const host = await makeHost();
+    const { started } = await startTown(host);
+    await host.harness.behavior.callAgentTool(
+      "town_sling",
+      {
+        title: "Fix checkout totals",
+        mission: "Totals double-count tax; fix and verify with the cart test.",
+        openPr: true,
+      },
+      { threadId: started.threadId },
+    );
+    const spawns = host.harness.inspection.sdk.callsTo("threads.spawn");
+    const prompt = (spawns[spawns.length - 1]![0] as { prompt: string }).prompt;
+    expect(prompt).toContain("The owner approved opening a pull request for this task.");
+    expect(prompt).toContain("gh pr create");
+    expect(prompt).toContain("Put the pull request URL in your final report.");
+  });
+
   it("reports an empty town before setup", async () => {
     const host = await makeHost();
     const status = (await host.harness.behavior.callRpc("status", null)) as {
@@ -188,7 +207,6 @@ describe("madmax town backend", () => {
       },
       { threadId: started.threadId },
     );
-
     const spawns = host.harness.inspection.sdk.callsTo("threads.spawn");
     expect(spawns).toHaveLength(2);
     const spawn = spawns[1]![0] as Record<string, any>;
@@ -205,7 +223,9 @@ describe("madmax town backend", () => {
       workspace: { type: "managed-worktree", baseBranch: { kind: "default" } },
     });
     expect(spawn.reasoningLevel).toBe("high"); // medium tier default
-    expect(spawn.prompt).toContain("You are a polecat in the town of MyTown");
+    expect(spawn.prompt).toContain("You work for the town of MyTown");
+    expect(spawn.prompt).toContain("## Task");
+    expect(spawn.prompt).toContain("Do not open a pull request");
 
     const roster = await host.harness.behavior.callAgentTool("town_roster", {}, { threadId: started.threadId });
     expect(String(roster)).toContain("Fix checkout totals");
@@ -853,6 +873,104 @@ describe.skipIf(!bdAvailable)("madmax ledger (real bd)", () => {
     const spawns = host.harness.inspection.sdk.callsTo("threads.spawn");
     const slingSpawn = spawns[spawns.length - 1]![0] as Record<string, unknown>;
     expect(slingSpawn.projectId).toBe("proj_cloned_rig");
+  });
+
+  it("town_review full mode spawns one reviewer per lens with the phased contract", async () => {
+    const { host, dir, mayorId } = await makeLedgerHost();
+    const polecatId = await slingFirstBead(host, dir, mayorId);
+
+    const result = await host.harness.behavior.callAgentTool(
+      "town_review",
+      {
+        threadId: polecatId,
+        mode: "full",
+        persona: "a seasoned, high-level Elixir/Phoenix software engineer",
+        criteria: ["security", "performance"],
+      },
+      { threadId: mayorId },
+    );
+    expect(String(result)).toContain("Started");
+    expect(String(result)).toContain("Review · Add login endpoint · security");
+    expect(String(result)).toContain("Review · Add login endpoint · performance");
+
+    const spawns = host.harness.inspection.sdk.callsTo("threads.spawn");
+    const reviewerSpawns = spawns.slice(-2).map((args) => args[0] as Record<string, unknown>);
+    for (const spawn of reviewerSpawns) {
+      const prompt = spawn.prompt as string;
+      expect(prompt).toContain("a seasoned, high-level Elixir/Phoenix software engineer");
+      expect(prompt).toContain("Phase 1 — Find");
+      expect(prompt).toContain("Phase 2 — Verify");
+      expect(prompt).toContain("Phase 3 — Report");
+      expect(prompt).toContain("[HIGH]");
+      expect(prompt).toContain("Do not modify files");
+      expect(spawn.environment).toEqual({ type: "reuse", environmentId: "env_work_1" });
+    }
+    expect((reviewerSpawns[0]!.prompt as string)).toContain("Your lens: security");
+    expect((reviewerSpawns[1]!.prompt as string)).toContain("Your lens: performance");
+  });
+
+  it("town_pr_review mints a dedicated bead and spawns PR reviewers in the rig", async () => {
+    const { host, dir, mayorId } = await makeLedgerHost();
+    const { origin } = await makeWorktree();
+    const rigName = origin.split("/").pop()!;
+    host.harness.inspection.sdk.stub("projects.get", (args: { projectId: string }) => ({
+      id: args.projectId,
+      name: args.projectId === "proj_cloned_rig" ? rigName : "MyTown",
+      kind: "standard",
+      gitRemoteUrl: null,
+      createdAt: 0,
+      updatedAt: 0,
+      sources: [
+        {
+          id: "src_1", projectId: args.projectId, hostId: "host_1",
+          isDefault: true, path: dir, type: "local_path", createdAt: 0, updatedAt: 0,
+        },
+      ],
+    }));
+    host.harness.inspection.sdk.stub("projects.create", (args: { name: string }) => ({
+      id: "proj_cloned_rig",
+      name: args.name,
+      kind: "standard",
+      sources: [],
+    }));
+
+    const result = await host.harness.behavior.callAgentTool(
+      "town_pr_review",
+      { gitUrl: origin, prNumber: 7, mode: "full", criteria: ["security", "quality"] },
+      { threadId: mayorId },
+    );
+    expect(String(result)).toContain("#7");
+
+    // A dedicated bead exists for the review task, tagged with the rig.
+    const issues = await bdList(dir);
+    const bead = issues.find((issue) => issue.title === `Review PR #7 of ${rigName}`)!;
+    expect(bead.labels).toContain(rigName);
+
+    // Two lens reviewers spawned in the rig project, each linked to the bead.
+    const spawns = host.harness.inspection.sdk.callsTo("threads.spawn");
+    const reviewerSpawns = spawns.slice(-2).map((args) => args[0] as Record<string, unknown>);
+    for (const spawn of reviewerSpawns) {
+      expect(spawn.projectId).toBe("proj_cloned_rig");
+      expect((spawn.pluginMetadata as Record<string, unknown>).beadId).toBe(bead.id);
+      expect(spawn.environment).toMatchObject({
+        type: "host",
+        workspace: { type: "managed-worktree", baseBranch: { kind: "default" } },
+      });
+      const prompt = spawn.prompt as string;
+      expect(prompt).toContain("gh pr checkout 7");
+      expect(prompt).toContain("gh pr diff 7");
+      expect(prompt).toContain("Do not modify files");
+    }
+
+    // The reviewer threads carry the bead, so their reports land on it.
+    const status = (await host.harness.behavior.callRpc("status", null)) as {
+      threads: { threadId: string; role: string; beadId: string | null; title: string }[];
+    };
+    const reviewers = status.threads.filter((thread) => thread.title.startsWith("PR review"));
+    expect(reviewers).toHaveLength(2);
+    for (const reviewer of reviewers) {
+      expect(reviewer.beadId).toBe(bead.id);
+    }
   });
 
   it("ledgerInit initializes a bare town checkout", async () => {

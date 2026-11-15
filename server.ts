@@ -94,6 +94,7 @@ const slingParams = z.object({
   tier: tierSchema.optional().describe("Model tier for this work item; defaults to 'difficult'."),
   rigProjectId: z.string().trim().min(1).optional().describe("Registered rig project to work in; defaults to the bead's rig label, else the town project."),
   beadId: z.string().trim().min(1).optional().describe("Bead to sling from the town ledger; its title and description become the brief."),
+  openPr: z.boolean().optional().describe("The owner has approved opening a pull request for this work. The polecat pushes its branch and opens the PR when the work is complete."),
 });
 
 const optionalReport = z.object({
@@ -160,6 +161,26 @@ const createRigParams = z.object({
     .regex(/^[A-Za-z0-9._-]+$/)
     .optional()
     .describe("Rig name; defaults to the repository's name."),
+});
+
+const reviewSpecParams = {
+  mode: z.enum(["lite", "full"]).optional().describe("lite: one reviewer covers all criteria. full: one reviewer per criterion (lens)."),
+  persona: z.string().trim().max(500).optional().describe("Review persona, e.g. 'a seasoned, high-level Elixir/Phoenix software engineer'."),
+  criteria: z.array(z.string().trim().min(1).max(100)).max(10).optional().describe("What to assess; defaults to security, maintainability, performance, quality."),
+};
+
+const reviewParams = z.object({
+  threadId: z.string(),
+  focus: z.string().trim().max(4_000).optional().describe("What the review should concentrate on."),
+  ...reviewSpecParams,
+});
+
+const prReviewParams = z.object({
+  gitUrl: z.string().trim().min(1).max(2_000).optional().describe("Repository URL; finds or creates the rig. Omit when rigProjectId is given."),
+  rigProjectId: z.string().trim().min(1).optional().describe("Registered rig project that owns the pull request."),
+  prNumber: z.number().int().min(1),
+  ...reviewSpecParams,
+  focus: z.string().trim().max(2_000).optional(),
 });
 
 const boardBeadSchema = z.object({
@@ -866,7 +887,7 @@ export default async function plugin(bb: BbPluginApi) {
       "When the owner names a repository the town doesn't know, create the rig yourself with town_create_rig (give it the git URL); read GitHub issues with gh in your shell.",
       "Use town_roster for the town's threads. Before deciding, use town_inspect to read a thread's live status, persisted report, and last assistant output. Reports are evidence, not proof — verify with town_verify and commission independent reviews with town_review.",
       "Use town_nudge to answer a polecat's question or correct course; steer only a thread working something wrong right now.",
-      "Polecats report ready or blocked; only you decide when work is verified. Land verified work with town_land (branch pushed, bead to review) and mark it complete with town_complete. Escalate to the owner only genuine product decisions, credentials, external accounts, and irreversible actions — lead with a recommendation and the evidence.",
+      "Polecats report ready or blocked; only you decide when work is verified. Review adversarially before landing (town_review, lite or full, with a persona and criteria the owner names). Land verified work with town_land (branch pushed, bead to review) and mark it complete with town_complete. To review someone else's pull request, use town_pr_review — it mints the bead and the reviewer threads; you compile findings and draft the PR response, and the owner decides posting. Escalate to the owner only genuine product decisions, credentials, external accounts, and irreversible actions — lead with a recommendation and the evidence.",
       "", "## Town rules", rules,
       "", "Acknowledge the rules briefly, inspect the roster, and wait for work.",
     ].join("\n");
@@ -1111,27 +1132,47 @@ export default async function plugin(bb: BbPluginApi) {
     const rigName = rigProjectId === townId ? `${townName} (town work)` : await projectName(rigProjectId);
     const permissionMode = ((values.polecatPermissionMode as SpawnPermissionMode) || "accept-edits");
     const brief = [
-      `You are a polecat in the town of ${townName}, working on rig ${rigName}.`,
+      `You are a polecat. You work for the town of ${townName}. Your work area is rig ${rigName}.`,
       "",
-      `## Work item`,
+      "## Task",
       bead ? `${title} (bead ${bead.id} in the town ledger)` : title,
-      "", "## Goal", mission,
-      "", "## Success criteria", bullets(params.successCriteria),
-      "", "## Constraints", bullets(params.constraints),
+      "",
+      "## Goal",
+      mission,
+      "",
+      "## Success criteria",
+      bullets(params.successCriteria),
+      "",
+      "## Constraints",
+      bullets(params.constraints),
       ...(params.context ? ["", "## Context", params.context] : []),
+      ...(params.openPr
+        ? [
+            "",
+            "## Pull request",
+            "- The owner approved opening a pull request for this task.",
+            "- When your changes are done: commit your work on your branch, push the branch (git push -u origin HEAD), then create the pull request (gh pr create).",
+            "- Write a clear pull request title and a short description.",
+            "- Put the pull request URL in your final report.",
+          ]
+        : []),
       "",
-      "## Town rules",
-      "- Scope: only this work item. Your worktree is your workspace; do not touch other projects, other worktrees, or the town repo.",
-      "- Never commit to or merge the main/default branch of any repo.",
-      "- Do not push, merge, or delete anything unless your brief asks. Do not post comments or reviews to external services.",
-      "- Anything outside your worktree flows through the Mayor: report it, don't do it.",
-      "- Keep scope narrow and verify the user journey or the closest executable seam; do not substitute a typecheck for real verification.",
+      "## Rules",
+      "- Do only this task.",
+      "- Work only in your worktree. Do not touch other projects or other worktrees.",
+      "- Do not commit to or merge the main branch of any repository.",
+      "- Do not push, merge, or delete anything, unless this task says so.",
+      "- Do not post comments or reviews to external services.",
+      "- Do not open a pull request, unless this task says the owner approved it.",
+      "- Anything outside your worktree goes to the Mayor. Report it. Do not do it.",
+      "- Check your work yourself. Run the closest real check. A typecheck alone is not enough.",
       "",
-      "## Reporting",
-      "- Use polecat_report with state ready and a non-empty result when your work is ready for the Mayor's verification. A ready result names changed files, checks run, relevant output, residual risks, and the recommended next action.",
-      "- Report state blocked only with both a non-empty blocker and your recommended decision or next action.",
-      "- You talk to the Mayor, never directly to the owner. Do not ask the user from this thread.",
-      "- GUPP: run your brief without waiting.",
+      "## Report",
+      "- Use polecat_report. Use state ready when the work is done. Use state blocked when you cannot continue.",
+      "- A ready report states: what you changed, which files, which checks you ran, what remains.",
+      "- A blocked report states: the blocker, and your recommended next step.",
+      "- You talk to the Mayor. Do not talk to the owner.",
+      "- Run the task without waiting for more instructions.",
     ].join("\n");
     const thread = await bb.sdk.threads.spawn({
       projectId: rigProjectId,
@@ -1450,14 +1491,78 @@ export default async function plugin(bb: BbPluginApi) {
       .join("\n");
   }
 
-  /** Commission an independent, read-only review in the worker's worktree. */
-  async function startReview(threadId: string, focus?: string) {
+  /** The shared shape of a deep review: mode, persona, criteria, focus. */
+  type ReviewSpec = {
+    mode: "lite" | "full";
+    persona: string;
+    criteria: string[];
+    focus?: string;
+  };
+
+  function reviewSpecFrom(params: {
+    mode?: "lite" | "full";
+    persona?: string;
+    criteria?: string[];
+    focus?: string;
+  }): ReviewSpec {
+    return {
+      mode: params.mode ?? "lite",
+      persona: params.persona?.trim() || "a senior software engineer for this codebase",
+      criteria: params.criteria?.length ? params.criteria : ["security", "maintainability", "performance", "quality"],
+      focus: params.focus?.trim() || undefined,
+    };
+  }
+
+  function reviewerPrompt(input: {
+    lens: string;
+    spec: ReviewSpec;
+    subject: string;
+    preamble: string[];
+  }): string {
+    const lines = [
+      `Persona: ${input.spec.persona}.`,
+      `Your lens: ${input.lens}. Judge only through this lens.`,
+      ...(input.spec.focus ? [`Review focus: ${input.spec.focus}`] : []),
+      ...input.preamble,
+      "",
+      "Work in phases. Do them in order.",
+      "",
+      "Phase 1 — Find. Read the changed files and the diff. List every problem you see through your lens. Give each finding a confidence: HIGH, MEDIUM, or LOW. Include the file and line.",
+      "Phase 2 — Verify. Re-check each HIGH finding against the code. Mark it CONFIRMED or REFUTED. State the evidence.",
+      "Phase 3 — Report. Send polecat_report with state ready. Use exactly this format:",
+      "",
+      "## Findings",
+      "- [HIGH] <finding> — <file>:<line>",
+      "- [MEDIUM] <finding> — <file>:<line>",
+      "- [LOW] <finding> — <file>:<line>",
+      "",
+      "## Verified",
+      "- CONFIRMED: <finding> — <evidence>",
+      "- REFUTED: <finding> — <why>",
+      "",
+      "## Verdict",
+      "ship | fix — <one short reason>",
+      "",
+      "Rules:",
+      "- Report only what you verified or saw yourself. Do not guess.",
+      "- Do not modify files. A repair needs an explicit instruction from the Mayor.",
+      "- Do not post anything to external services. Do not approve or reject anything.",
+      "- You may run the project's tests.",
+      "- Zero findings is a valid result. Say so and ship.",
+    ];
+    return lines.join("\n");
+  }
+
+  /** Commission independent reviews of an idle polecat's work (lite or full). */
+  async function startReview(threadId: string, specInput: ReviewSpec) {
     const worker = roles.get(threadId);
     if (!worker || worker.role !== "polecat") throw new Error(`No managed polecat ${threadId}.`);
     const existing = db
-      .prepare(`SELECT * FROM town_threads WHERE role='reviewer' AND worker_thread_id=? AND state NOT IN ('complete','archived','deleted') LIMIT 1`)
-      .get(threadId) as ManagedRow | undefined;
-    if (existing) return { threadId: existing.thread_id, title: existing.title, created: false };
+      .prepare(`SELECT * FROM town_threads WHERE role='reviewer' AND worker_thread_id=? AND state NOT IN ('complete','archived','deleted')`)
+      .all(threadId) as ManagedRow[];
+    if (existing.length > 0) {
+      return { beadId: worker.bead_id, reviewers: existing.map((row) => ({ threadId: row.thread_id, title: row.title })), created: false };
+    }
     const live = await bb.sdk.threads.get({ threadId });
     if (BUSY_STATUSES.has(live.status)) {
       throw new Error(`Polecat ${threadId} is ${live.status}; wait until it is idle before starting a review.`);
@@ -1466,39 +1571,142 @@ export default async function plugin(bb: BbPluginApi) {
     if (!live.environmentId) throw new Error(`Polecat ${threadId} has no reusable worktree to review.`);
     const values = await settings.get();
     const sectionId = await ensureSection();
-    const title = `Review · ${worker.title}`;
-    const prompt = [
-      `Independently review the polecat work for “${worker.title}” (thread ${threadId}).`,
-      focus ? `Review focus: ${focus}` : "Review for correctness, regressions, validation quality, and unnecessary complexity.",
-      "This is a read-only review: do not modify files unless the Mayor later sends an explicit instruction authorizing a repair pass.",
-      "Inspect the actual worktree and its evidence; do not rely only on the polecat's claims.",
-      "Report findings and a ship/fix verdict with polecat_report (state ready); the verdict is recorded on the town ledger.",
-      "Do not broaden scope or make product decisions. Recommend escalation when a real decision is required.",
-    ].join("\n");
-    const thread = await bb.sdk.threads.spawn({
-      projectId: worker.project_id,
-      environment: { type: "reuse", environmentId: live.environmentId },
-      sectionId,
-      visibility: "visible",
-      title,
-      parentThreadId: worker.mayor_thread_id ?? undefined,
-      parentNotifications: "stuck",
-      pluginMetadata: { role: "reviewer", beadId: worker.bead_id, rig: worker.project_id },
-      ...(values.reviewerProvider ? { providerId: values.reviewerProvider as string } : {}),
-      ...(values.reviewerModel ? { model: values.reviewerModel as string } : {}),
-      ...(values.reviewerReasoning ? { reasoningLevel: values.reviewerReasoning as string } : {}),
-      prompt,
-    });
-    insertThread({
-      threadId: thread.id, role: "reviewer", projectId: worker.project_id,
-      mayorThreadId: worker.mayor_thread_id, beadId: worker.bead_id,
-      title, state: "starting", status: thread.status,
-    });
-    db.prepare(`UPDATE town_threads SET worker_thread_id=? WHERE thread_id=?`).run(threadId, thread.id);
-    reloadRoles();
+
+    const lenses = specInput.mode === "full" ? specInput.criteria : [specInput.criteria.join(", ")];
+    const reviewers: { threadId: string; title: string }[] = [];
+    for (const lens of lenses) {
+      const lensTag = specInput.mode === "full" ? ` · ${lens}` : "";
+      const title = `Review · ${worker.title}${lensTag}`;
+      const prompt = reviewerPrompt({
+        lens,
+        spec: specInput,
+        subject: worker.title,
+        preamble: [
+          `You review the work of another agent. The work is in this worktree.`,
+          `Work under review: “${worker.title}” by thread ${threadId}.`,
+        ],
+      });
+      const thread = await bb.sdk.threads.spawn({
+        projectId: worker.project_id,
+        environment: { type: "reuse", environmentId: live.environmentId },
+        sectionId,
+        visibility: "visible",
+        title,
+        parentThreadId: worker.mayor_thread_id ?? undefined,
+        parentNotifications: "stuck",
+        pluginMetadata: { role: "reviewer", beadId: worker.bead_id, rig: worker.project_id },
+        ...(values.reviewerProvider ? { providerId: values.reviewerProvider as string } : {}),
+        ...(values.reviewerModel ? { model: values.reviewerModel as string } : {}),
+        ...(values.reviewerReasoning ? { reasoningLevel: values.reviewerReasoning as string } : {}),
+        prompt,
+      });
+      insertThread({
+        threadId: thread.id, role: "reviewer", projectId: worker.project_id,
+        mayorThreadId: worker.mayor_thread_id, beadId: worker.bead_id,
+        title, state: "starting", status: thread.status,
+      });
+      db.prepare(`UPDATE town_threads SET worker_thread_id=? WHERE thread_id=?`).run(threadId, thread.id);
+      reloadRoles();
+      reviewers.push({ threadId: thread.id, title });
+      logEvent("review", `Review started for “${worker.title}” (lens: ${lens})`, thread.id, worker.bead_id);
+    }
     publishTown();
-    logEvent("review", `Review started for “${worker.title}”`, thread.id, worker.bead_id);
-    return { threadId: thread.id, title, created: true };
+    return { beadId: worker.bead_id, reviewers, created: true };
+  }
+
+  /** Review someone else's pull request as a town task: dedicated bead, visible threads. */
+  async function startPrReview(params: z.infer<typeof prReviewParams>) {
+    if (!params.gitUrl && !params.rigProjectId) {
+      throw new Error("Give the repository gitUrl (the town will find or create the rig) or the rigProjectId.");
+    }
+    await ensureLedger();
+    const spec = reviewSpecFrom(params);
+    let rigProjectId = params.rigProjectId ?? null;
+    let rigName: string;
+    if (rigProjectId !== null) {
+      if (!isRig(rigProjectId)) {
+        throw new Error(`Project ${rigProjectId} is not a registered rig. Register it first: bb madmax rig add ${rigProjectId}`);
+      }
+      rigName = (rigById.get(rigProjectId) as RigRow).name;
+    } else {
+      const derived = rigNameFromUrl(params.gitUrl!);
+      const known = (allRigs.all() as RigRow[]).find((row) => row.name === derived);
+      if (known) {
+        rigProjectId = known.project_id;
+        rigName = known.name;
+      } else {
+        const created = await createRig({ gitUrl: params.gitUrl! });
+        rigProjectId = created.projectId;
+        rigName = created.name;
+      }
+    }
+    const prLabel = `${rigName}#${params.prNumber}`;
+    const beadId = (await runBd([
+      "create",
+      `Review PR #${params.prNumber} of ${rigName}`,
+      "-d",
+      [
+        `Review the pull request ${prLabel} and report findings with confidence ratings.`,
+        ...(spec.focus ? [`Focus: ${spec.focus}`] : []),
+        `Mode: ${spec.mode}. Criteria: ${spec.criteria.join(", ")}.`,
+      ].join("\n"),
+      "-l",
+      rigName,
+      "--silent",
+    ])).trim();
+    invalidateLedger();
+    const values = await settings.get();
+    const sectionId = await ensureSection();
+    const hostId = await defaultHostId();
+
+    const lenses = spec.mode === "full" ? spec.criteria : [spec.criteria.join(", ")];
+    const reviewers: { threadId: string; title: string }[] = [];
+    for (const lens of lenses) {
+      const lensTag = spec.mode === "full" ? ` · ${lens}` : "";
+      const title = `PR review · ${prLabel}${lensTag}`;
+      const prompt = reviewerPrompt({
+        lens,
+        spec,
+        subject: title,
+        preamble: [
+          `You review a pull request of repository ${rigName}. Pull request: #${params.prNumber}.`,
+          "This is a review task. You do not write code for it.",
+          "",
+          "Do this first:",
+          `1. Run: gh pr view ${params.prNumber} --json title,body,additions,deletions,files,headRefName`,
+          `2. Run: gh pr checkout ${params.prNumber}`,
+          `3. Read every changed file. Use the diff: gh pr diff ${params.prNumber}`,
+        ],
+      });
+      const thread = await bb.sdk.threads.spawn({
+        projectId: rigProjectId,
+        environment: {
+          type: "host",
+          hostId,
+          workspace: { type: "managed-worktree", baseBranch: { kind: "default" } },
+        },
+        sectionId,
+        visibility: "visible",
+        title,
+        parentThreadId: mayorRow()?.thread_id ?? undefined,
+        parentNotifications: "stuck",
+        pluginMetadata: { role: "polecat", beadId, rig: rigProjectId },
+        permissionMode: (values.polecatPermissionMode as SpawnPermissionMode) || "accept-edits",
+        ...(values.reviewerProvider ? { providerId: values.reviewerProvider as string } : {}),
+        ...(values.reviewerModel ? { model: values.reviewerModel as string } : {}),
+        ...(values.reviewerReasoning ? { reasoningLevel: values.reviewerReasoning as string } : {}),
+        prompt,
+      });
+      insertThread({
+        threadId: thread.id, role: "polecat", projectId: rigProjectId,
+        mayorThreadId: mayorRow()?.thread_id ?? null, beadId, title,
+        state: "starting", status: thread.status,
+      });
+      reviewers.push({ threadId: thread.id, title });
+      logEvent("review", `PR review started: ${prLabel} (lens: ${lens})`, thread.id, beadId);
+    }
+    publishTown();
+    return { beadId, pr: prLabel, reviewers, created: true };
   }
 
   function stateFromLive(row: ManagedRow, status: string) {
@@ -1774,19 +1982,37 @@ export default async function plugin(bb: BbPluginApi) {
   });
   bb.agents.registerTool({
     name: "town_review",
-    description: "Start (or return) an independent read-only review of an idle polecat's work, in its own worktree; the verdict lands on the bead.",
-    parameters: z.object({
-      threadId: z.string(),
-      focus: z.string().trim().max(4_000).optional().describe("What the review should concentrate on."),
-    }),
-    async execute({ threadId, focus }, context) {
+    description: "Commission an adversarial review of an idle polecat's work, in its own worktree. Lite: one reviewer covers all criteria. Full: one reviewer per criterion. Reviewers report findings with confidence ratings; verified HIGH findings drive the fix loop.",
+    parameters: reviewParams,
+    async execute(params, context) {
       const caller = context.threadId ? roles.get(context.threadId) : undefined;
-      const target = roles.get(threadId);
+      const target = roles.get(params.threadId);
       if (!caller || caller.role !== "mayor" || !target || !belongsToMayor(target, caller.thread_id)) {
-        throw new Error(`No managed thread ${threadId} for this Mayor.`);
+        throw new Error(`No managed thread ${params.threadId} for this Mayor.`);
       }
-      const review = await startReview(threadId, focus);
-      return `${review.created ? "Started" : "Using existing"} “${review.title}” in thread ${review.threadId}.`;
+      const result = await startReview(params.threadId, reviewSpecFrom(params));
+      const lensList = result.reviewers.map((reviewer) => reviewer.title).join("; ");
+      return [
+        `${result.created ? "Started" : "Already running"}: ${lensList}.`,
+        "When the reviewer(s) report: compile the CONFIRMED findings, nudge the worker to fix them, and repeat the review until the verdict is ship. Only then land.",
+      ].join("\n");
+    },
+  });
+  bb.agents.registerTool({
+    name: "town_pr_review",
+    description: "Review someone else's pull request as a town task: finds or creates the rig, mints a dedicated bead, and spawns reviewer threads in that project that check out the PR and report findings with confidence ratings. Use when the owner points at a PR link and wants a review.",
+    parameters: prReviewParams,
+    async execute(params, context) {
+      const caller = context.threadId ? roles.get(context.threadId) : undefined;
+      if (!caller || caller.role !== "mayor" || ["complete", "archived", "deleted"].includes(caller.state)) {
+        throw new Error("town_pr_review requires an active registered Mayor thread.");
+      }
+      const result = await startPrReview(params);
+      const reviewerList = result.reviewers.map((reviewer) => reviewer.title).join("; ");
+      return [
+        `PR review of ${result.pr} is running (bead ${result.beadId}): ${reviewerList}.`,
+        "When the reviewer(s) report: compile the CONFIRMED findings, present them to the owner, and draft the PR response (approve, comment, or request changes). The owner decides whether to post it.",
+      ].join("\n");
     },
   });
   bb.agents.registerTool({
@@ -1933,7 +2159,7 @@ export default async function plugin(bb: BbPluginApi) {
     const rules = row ? (rulesCache.get(row.project_id) ?? BUILT_IN_RULES) : BUILT_IN_RULES;
     if (role === "mayor") {
       return {
-        tools: ["town_sling", "town_roster", "town_inspect", "town_nudge", "town_convoy", "town_ready", "town_complete", "town_review", "town_verify", "town_land", "town_create_rig"],
+        tools: ["town_sling", "town_roster", "town_inspect", "town_nudge", "town_convoy", "town_ready", "town_complete", "town_review", "town_verify", "town_land", "town_create_rig", "town_pr_review"],
         skills: ["mayor"],
         instructions: `You are the registered Mayor supervising the town's polecat threads from ${context.project.name}. Decompose goals into convoys (town_convoy), sling beads to polecats (town_sling), and drive work through verification (town_verify, town_review) and delivery (town_land) to verified completion (town_complete).\n\n${rules}`,
       };
@@ -1997,7 +2223,7 @@ export default async function plugin(bb: BbPluginApi) {
     "  bb madmax sling --title \"…\" --mission \"…\" [--criteria \"…\"]... [--constraint \"…\"]... [--context \"…\"] [--rig <project-id>] [--tier <tier>] [--json]",
     "  bb madmax nudge <thread-id> --text \"…\" [--steer] [--authorize-edits] [--json]",
     "  bb madmax inspect <thread-id>",
-    "  bb madmax review <thread-id> [--focus \"…\"] [--json]",
+    "  bb madmax review <thread-id> [--focus \"…\"] [--mode lite|full] [--json]",
     "  bb madmax verify <thread-id>",
     "  bb madmax land <thread-id>",
   ].join("\n");
@@ -2014,7 +2240,7 @@ export default async function plugin(bb: BbPluginApi) {
       { name: "sling", summary: "Sling a work item to a polecat", usage: "bb madmax sling --title \"…\" --mission \"…\" [--rig <project-id>] [--tier <tier>] [--json]" },
       { name: "nudge", summary: "Nudge a managed polecat", usage: "bb madmax nudge <thread-id> --text \"…\" [--steer] [--authorize-edits] [--json]" },
       { name: "inspect", summary: "Inspect a managed thread's evidence", usage: "bb madmax inspect <thread-id>" },
-      { name: "review", summary: "Start a read-only review of an idle polecat's work", usage: "bb madmax review <thread-id> [--focus \"…\"] [--json]" },
+      { name: "review", summary: "Start an adversarial review of an idle polecat's work", usage: "bb madmax review <thread-id> [--focus \"…\"] [--mode lite|full] [--json]" },
       { name: "verify", summary: "Gather git evidence from a managed thread's worktree", usage: "bb madmax verify <thread-id>" },
       { name: "land", summary: "Deliver: commit, push the branch, bead to review", usage: "bb madmax land <thread-id>" },
     ],
@@ -2146,8 +2372,13 @@ export default async function plugin(bb: BbPluginApi) {
         if (command === "review") {
           const threadId = args.positional[0];
           if (!threadId) return fail("review requires <thread-id>");
-          const result = await startReview(threadId, args.one("focus"));
-          return ok(result, `${result.created ? "Started" : "Using existing"} “${result.title}” in ${result.threadId}.`);
+          const mode = args.one("mode");
+          if (mode !== undefined && mode !== "lite" && mode !== "full") return fail("--mode must be lite or full");
+          const result = await startReview(threadId, reviewSpecFrom({ mode, focus: args.one("focus") }));
+          return ok(
+            result,
+            `${result.created ? "Started" : "Already running"}: ${result.reviewers.map((reviewer) => reviewer.title).join("; ")}`,
+          );
         }
         if (command === "verify") {
           const threadId = args.positional[0];
