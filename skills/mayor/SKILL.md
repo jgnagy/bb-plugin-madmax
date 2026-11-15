@@ -38,6 +38,8 @@ directly with `bd` in the town checkout (reports arrive as bead comments).
 | `town_inspect` | One thread's live status, persisted report, and last assistant output. Read evidence here before deciding. |
 | `town_buzzard` | Dispatch a Buzzard to a rig (on demand, or on the town's cron): pointless tests, obvious comments, dead code, abandoned PRs, unused dependencies — and optionally unmaintained ones. Reports to you, possibly with a draft cleanup PR. |
 | `town_imperator` | Dispatch an Imperator to a rig (on demand, or on cron): patrols for security problems. Reports ONLY to you — never issues, never PRs, never public posts. |
+| `town_adopt` | Bring an existing bb thread into the town — as a polecat (optionally owning a ledger bead) or as the new Mayor (retiring the old one and re-pointing its polecats). Use it for work that predates the town. |
+| `town_adopt_pr` | Adopt a pull request created outside the town: finds or creates the rig, mints a dedicated bead, and spawns a maintainer that keeps CI green and addresses review feedback. Comments, approvals, and merges stay owner-approved. |
 | `town_verify` | Deterministic worktree evidence for a thread: git status, diff stat, recent log. Run this before trusting any report. |
 | `town_review` | Commission an adversarial review of an idle polecat's work, in its own worktree. `mode: "lite"` = one reviewer covering all criteria; `mode: "full"` = one reviewer per criterion. Pass the `persona` the owner names ("a seasoned, high-level Elixir/Phoenix engineer") and custom `criteria`. Reviewers report findings with HIGH/MEDIUM/LOW confidence, verify the HIGH ones, and give a ship/fix verdict. |
 | `town_pr_review` | Review someone else's pull request as a town task: finds or creates the rig, mints a dedicated bead, and spawns reviewer threads in that project that check out the PR. You compile the findings and draft the PR response. |
@@ -177,6 +179,22 @@ them wait on a busy thread.
   thread. Keep every turn short.
 - Reviewers, patrols, and polecats are your background workers — blocking
   is their job, not yours.
+
+## Adoption: bringing outside work into the town
+
+**Threads.** Work that predates the town can join it: `town_adopt` an
+existing thread as a polecat (link it to a bead when it owns one — the
+bead is claimed on adoption), or adopt a thread in the town project as
+the new Mayor — the previous Mayor retires and its polecats and pending
+alerts re-point automatically. Adopted threads file in the Town section
+and report like any other.
+
+**Pull requests.** A PR created outside the town can be maintained by
+it: `town_adopt_pr` finds or creates the rig, mints a dedicated bead,
+and spawns a maintainer that checks out the PR, fixes failing checks,
+and addresses review feedback — pushing to the PR branch as needed.
+Posting comments, approvals, and merging stay owner-approved; relay the
+maintainer's report and bring the owner what it cannot decide.
 
 ## Rules
 

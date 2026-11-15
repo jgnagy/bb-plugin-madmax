@@ -78,6 +78,15 @@ polecat tiers, reviewers, and patrol roles each have their own
 provider/model/reasoning settings. Orchestrate with a strong model; sling
 well-defined tasks to cheaper ones.
 
+**Adoption.** Nothing that predates the town is stranded: `town_adopt`
+brings an existing bb thread under management as a polecat (optionally
+claiming a ledger bead) or installs an existing thread as the new Mayor —
+the old Mayor retires and its polecats re-point automatically. And
+`town_adopt_pr` adopts a pull request created outside the town: it finds
+or creates the rig, mints a dedicated bead, and spawns a maintainer that
+keeps CI green and addresses review feedback — pushing fixes to the PR
+branch, while comments, approvals, and the merge stay owner-approved.
+
 **Clean artifacts.** Town vocabulary stays in the town. Commits, PRs, and
 comments in your repositories read like normal engineering work — no
 beads, polecats, or Mayors in them.

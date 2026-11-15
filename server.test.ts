@@ -115,6 +115,72 @@ describe("madmax town backend", () => {
     expect(prompt).toContain("Put the pull request URL in your final report.");
   });
 
+  it("adopts an existing thread as a polecat and re-points a Mayor", async () => {
+    const host = await makeHost();
+    const { started } = await startTown(host);
+    host.harness.inspection.sdk.stub("threads.update", () => ({ ok: true }));
+    // A pre-madmax worker thread, idle, in a project of its own.
+    host.harness.inspection.sdk.stub("threads.get", (args: { threadId: string }) =>
+      makeThreadResponse({
+        id: args.threadId,
+        status: "idle",
+        projectId: "proj_elsewhere",
+        title: "Old worker thread",
+        deletedAt: null,
+        archivedAt: null,
+      }));
+
+    const adopted = await host.harness.behavior.callAgentTool(
+      "town_adopt",
+      { threadId: "thr_pre_madmax" },
+      { threadId: started.threadId },
+    );
+    expect(String(adopted)).toContain("Adopted thread thr_pre_madmax as polecat");
+
+    // The thread was re-filed into the Town section, visibly, un-renamed.
+    const updates = host.harness.inspection.sdk.callsTo("threads.update");
+    expect(updates[updates.length - 1]![0]).toMatchObject({
+      threadId: "thr_pre_madmax",
+      sectionId: "sec_town",
+      visibility: "visible",
+    });
+
+    // It appears on the roster and is gated like a polecat.
+    const status = (await host.harness.behavior.callRpc("status", null)) as {
+      threads: { threadId: string; role: string }[];
+    };
+    const adoptedRow = status.threads.find((thread) => thread.threadId === "thr_pre_madmax");
+    expect(adoptedRow?.role).toBe("polecat");
+    const configuration = await host.harness.behavior.resolveAgentConfiguration(
+      makePluginAgentConfigurationContext({ thread: { id: "thr_pre_madmax" } }),
+    );
+    expect(configuration.tools.map((tool: { name: string }) => tool.name)).toEqual(["polecat_report"]);
+
+    // Adopting a new Mayor retires the old one and re-points the roster.
+    host.harness.inspection.sdk.stub("threads.get", (args: { threadId: string }) =>
+      makeThreadResponse({
+        id: args.threadId,
+        status: "idle",
+        projectId: "proj_town",
+        title: "New Mayor thread",
+        deletedAt: null,
+        archivedAt: null,
+      }));
+    const reMayored = await host.harness.behavior.callAgentTool(
+      "town_adopt",
+      { threadId: "thr_new_mayor", role: "mayor" },
+      { threadId: started.threadId },
+    );
+    expect(String(reMayored)).toContain("The previous Mayor is retired");
+    const after = (await host.harness.behavior.callRpc("status", null)) as {
+      mayor: { threadId: string } | null;
+      threads: { threadId: string; role: string; mayorThreadId: string | null }[];
+    };
+    expect(after.mayor?.threadId).toBe("thr_new_mayor");
+    const rePointed = after.threads.find((thread) => thread.threadId === "thr_pre_madmax");
+    expect(rePointed?.mayorThreadId).toBe("thr_new_mayor");
+  });
+
   it("reports an empty town before setup", async () => {
     const host = await makeHost();
     const status = (await host.harness.behavior.callRpc("status", null)) as {
@@ -1079,6 +1145,60 @@ describe.skipIf(!bdAvailable)("madmax ledger (real bd)", () => {
     expect(
       patrolSpawns.some((spawn) => (spawn.prompt as string).includes("You are an Imperator")),
     ).toBe(true);
+  });
+
+  it("town_adopt_pr mints a maintenance bead and spawns a maintainer", async () => {
+    const { host, dir, mayorId } = await makeLedgerHost();
+    const { origin } = await makeWorktree();
+    const rigName = origin.split("/").pop()!;
+    host.harness.inspection.sdk.stub("projects.get", (args: { projectId: string }) => ({
+      id: args.projectId,
+      name: args.projectId === "proj_cloned_rig" ? rigName : "MyTown",
+      kind: "standard",
+      gitRemoteUrl: null,
+      createdAt: 0,
+      updatedAt: 0,
+      sources: [
+        {
+          id: "src_1", projectId: args.projectId, hostId: "host_1",
+          isDefault: true, path: dir, type: "local_path", createdAt: 0, updatedAt: 0,
+        },
+      ],
+    }));
+    host.harness.inspection.sdk.stub("projects.create", (args: { name: string }) => ({
+      id: "proj_cloned_rig",
+      name: args.name,
+      kind: "standard",
+      sources: [],
+    }));
+
+    const result = await host.harness.behavior.callAgentTool(
+      "town_adopt_pr",
+      { gitUrl: origin, prNumber: 7 },
+      { threadId: mayorId },
+    );
+    expect(String(result)).toContain(`Adopted PR ${rigName}#7`);
+
+    // A dedicated maintenance bead exists, tagged with the rig.
+    const issues = await bdList(dir);
+    const bead = issues.find((issue) => issue.title === `Maintain PR #7 of ${rigName}`)!;
+    expect(bead.labels).toContain(rigName);
+
+    // The maintainer spawned in the rig, linked to the bead, with the
+    // maintenance brief: checkout authorized, posting forbidden, clean text.
+    const spawns = host.harness.inspection.sdk.callsTo("threads.spawn");
+    const spawn = spawns[spawns.length - 1]![0] as Record<string, unknown>;
+    expect(spawn.projectId).toBe("proj_cloned_rig");
+    expect((spawn.pluginMetadata as Record<string, unknown>).beadId).toBe(bead.id);
+    expect(spawn.environment).toMatchObject({
+      type: "host",
+      workspace: { type: "managed-worktree", baseBranch: { kind: "default" } },
+    });
+    const prompt = spawn.prompt as string;
+    expect(prompt).toContain("gh pr checkout 7");
+    expect(prompt).toContain("Push commits to the pull request branch");
+    expect(prompt).toContain("Do not post comments, reviews, or approvals. Do not merge.");
+    expect(prompt).toContain("No internal vocabulary");
   });
 
   it("ledgerInit initializes a bare town checkout", async () => {

@@ -152,6 +152,18 @@ const completeParams = z.object({
   result: z.string().trim().max(MAX_RESULT_LENGTH).optional().describe("The verified outcome recorded on the bead."),
 });
 
+const adoptParams = z.object({
+  threadId: z.string().trim().min(1).describe("The existing bb thread to adopt."),
+  role: z.enum(["mayor", "polecat"]).optional().describe("Role to adopt the thread into; defaults to polecat."),
+  beadId: z.string().trim().min(1).optional().describe("Ledger bead this thread owns; claimed if open."),
+});
+
+const adoptPrParams = z.object({
+  gitUrl: z.string().trim().min(1).max(2_000).optional().describe("Repository URL; finds or creates the rig. Omit when rigProjectId is given."),
+  rigProjectId: z.string().trim().min(1).optional().describe("Registered rig project that owns the pull request."),
+  prNumber: z.number().int().min(1),
+});
+
 const createRigParams = z.object({
   gitUrl: z.string().trim().min(1).max(2_000).describe("HTTPS or SSH URL of the repository to clone as a rig."),
   name: z
@@ -1656,30 +1668,11 @@ export default async function plugin(bb: BbPluginApi) {
 
   /** Review someone else's pull request as a town task: dedicated bead, visible threads. */
   async function startPrReview(params: z.infer<typeof prReviewParams>) {
-    if (!params.gitUrl && !params.rigProjectId) {
-      throw new Error("Give the repository gitUrl (the town will find or create the rig) or the rigProjectId.");
-    }
     await ensureLedger();
     const spec = reviewSpecFrom(params);
-    let rigProjectId = params.rigProjectId ?? null;
-    let rigName: string;
-    if (rigProjectId !== null) {
-      if (!isRig(rigProjectId)) {
-        throw new Error(`Project ${rigProjectId} is not a registered rig. Register it first: bb madmax rig add ${rigProjectId}`);
-      }
-      rigName = (rigById.get(rigProjectId) as RigRow).name;
-    } else {
-      const derived = rigNameFromUrl(params.gitUrl!);
-      const known = (allRigs.all() as RigRow[]).find((row) => row.name === derived);
-      if (known) {
-        rigProjectId = known.project_id;
-        rigName = known.name;
-      } else {
-        const created = await createRig({ gitUrl: params.gitUrl! });
-        rigProjectId = created.projectId;
-        rigName = created.name;
-      }
-    }
+    const target = await resolveRigTarget(params);
+    const rigProjectId = target.projectId;
+    const rigName = target.name;
     const prLabel = `${rigName}#${params.prNumber}`;
     const beadId = (await runBd([
       "create",
@@ -1749,6 +1742,151 @@ export default async function plugin(bb: BbPluginApi) {
     return { beadId, pr: prLabel, reviewers, created: true };
   }
 
+  // ── Adoption: bring existing threads and PRs into the town ───────────
+
+  /** Adopt an existing bb thread into a town role. */
+  async function adoptThread(params: z.infer<typeof adoptParams>) {
+    const role = params.role ?? "polecat";
+    const thread = await bb.sdk.threads.get({ threadId: params.threadId });
+    if (thread.deletedAt !== null || thread.archivedAt !== null) {
+      throw new Error(`${params.threadId} is not a live thread.`);
+    }
+    const sectionId = await ensureSection();
+    let bead: Bead | null = null;
+    if (params.beadId) {
+      await ensureLedger();
+      const found = await bdJson<Bead[]>(["show", params.beadId]).catch(() => null);
+      bead = found?.[0] ?? null;
+      if (!bead) throw new Error(`No bead ${params.beadId} in the town ledger.`);
+      if (bead.status !== "closed") {
+        await runBd(["update", bead.id, "--claim"]);
+        invalidateLedger();
+      }
+    }
+    const townId = await configuredTownProject();
+    const title =
+      role === "mayor"
+        ? `Mayor · ${await projectName(townId ?? thread.projectId)}`
+        : (thread.title ?? `Adopted ${role}`);
+    if (role === "mayor") {
+      if (!townId) throw new Error(await noTownMessage());
+      if (thread.projectId !== townId) {
+        throw new Error(
+          `A Mayor must live in the town project (${townId}); ${params.threadId} is in ${thread.projectId}. Adopt it as a polecat instead, or move the town.`,
+        );
+      }
+    }
+    await bb.sdk.threads.update({
+      threadId: params.threadId,
+      sectionId,
+      visibility: "visible",
+      ...(role === "mayor" ? { title } : {}),
+    });
+    // Replacing a Mayor: retire the old one and re-point its polecats and
+    // any undelivered alerts at the adopted thread.
+    const previous = role === "mayor" ? mayorRow() : null;
+    if (previous && previous.thread_id !== params.threadId) {
+      const now = Date.now();
+      db.transaction(() => {
+        db.prepare(`UPDATE town_threads SET state='complete', updated_at=? WHERE thread_id=?`).run(now, previous.thread_id);
+        db.prepare(`UPDATE town_threads SET mayor_thread_id=?, updated_at=?
+          WHERE mayor_thread_id=? AND state NOT IN ('complete','archived','deleted')`).run(
+          params.threadId, now, previous.thread_id,
+        );
+        db.prepare(`UPDATE alert_outbox SET target_thread_id=?
+          WHERE target_thread_id=? AND delivered_at IS NULL`).run(params.threadId, previous.thread_id);
+      })();
+    }
+    insertThread({
+      threadId: params.threadId,
+      role,
+      projectId: thread.projectId,
+      mayorThreadId: role === "mayor" ? null : (mayorRow()?.thread_id ?? null),
+      beadId: bead?.id ?? null,
+      title,
+      state: BUSY_STATUSES.has(thread.status) ? "active" : "idle",
+      status: thread.status,
+    });
+    logEvent(
+      "adopt",
+      `Thread “${title}” adopted as ${role}${bead ? ` (bead ${bead.id})` : ""}`,
+      params.threadId,
+      bead?.id ?? null,
+    );
+    return { threadId: params.threadId, role, beadId: bead?.id ?? null };
+  }
+
+  /** Adopt an external pull request for town maintenance: dedicated bead + maintainer. */
+  async function adoptPr(params: z.infer<typeof adoptPrParams>) {
+    await ensureLedger();
+    const target = await resolveRigTarget(params);
+    const prLabel = `${target.name}#${params.prNumber}`;
+    const beadId = (await runBd([
+      "create",
+      `Maintain PR #${params.prNumber} of ${target.name}`,
+      "-d",
+      [
+        `Adopt pull request ${prLabel} for town maintenance.`,
+        "Keep CI green, address review feedback, and drive the PR to merge readiness.",
+        "Pushes to the PR branch are authorized; posting comments, approvals, and merges stay owner-approved.",
+      ].join("\n"),
+      "-l",
+      target.name,
+      "--silent",
+    ])).trim();
+    invalidateLedger();
+    const values = await settings.get();
+    const sectionId = await ensureSection();
+    const hostId = await defaultHostId();
+    const title = `PR maintain · ${prLabel}`;
+    const prompt = [
+      `You maintain a pull request. The town adopted it.`,
+      `Repository: ${target.name}. Pull request: #${params.prNumber}.`,
+      "",
+      "Do this:",
+      `1. Run: gh pr view ${params.prNumber} --json title,body,state,statusCheckRollup,reviewDecision,headRefName`,
+      `2. Run: gh pr checkout ${params.prNumber}`,
+      "3. Read the review comments. Read the failed checks, if any.",
+      "4. Fix what is broken. Commit your fixes. Push to the pull request branch.",
+      `5. Check the state: gh pr checks ${params.prNumber}. Run it again after each push.`,
+      "",
+      "Rules:",
+      "- Push commits to the pull request branch when you fix something.",
+      "- Do not post comments, reviews, or approvals. Do not merge. Those need the owner's approval through the Mayor.",
+      "- Do not force-push. Do not delete the branch.",
+      "- Commit messages and pull request text read like a normal engineer wrote them. No internal vocabulary.",
+      "- If a review comment asks for a product decision you cannot make, report blocked.",
+      "",
+      "Report:",
+      "- Use polecat_report with state ready when the PR is green and the review feedback is addressed.",
+      "- Use polecat_report with state blocked when something needs the owner.",
+      "- List: what you fixed, the check status, and the review comments that remain.",
+    ].join("\n");
+    const thread = await bb.sdk.threads.spawn({
+      projectId: target.projectId,
+      environment: {
+        type: "host",
+        hostId,
+        workspace: { type: "managed-worktree", baseBranch: { kind: "default" } },
+      },
+      sectionId,
+      visibility: "visible",
+      title,
+      parentThreadId: mayorRow()?.thread_id ?? undefined,
+      parentNotifications: "stuck",
+      pluginMetadata: { role: "polecat", beadId, rig: target.projectId },
+      permissionMode: (values.polecatPermissionMode as SpawnPermissionMode) || "accept-edits",
+      prompt,
+    });
+    insertThread({
+      threadId: thread.id, role: "polecat", projectId: target.projectId,
+      mayorThreadId: mayorRow()?.thread_id ?? null, beadId, title,
+      state: "starting", status: thread.status,
+    });
+    logEvent("adopt", `PR ${prLabel} adopted for maintenance`, thread.id, beadId);
+    return { beadId, pr: prLabel, threadId: thread.id };
+  }
+
   // ── Patrol roles: the Buzzard (cruft) and the Imperator (security) ──
 
   function patrolSettingsPrefix(role: PatrolRole) {
@@ -1811,7 +1949,8 @@ export default async function plugin(bb: BbPluginApi) {
     ].join("\n");
   }
 
-  async function resolvePatrolTarget(params: { rigProjectId?: string; gitUrl?: string }): Promise<{
+  /** Resolve a rig target: registered id, or find-or-create by git URL. */
+  async function resolveRigTarget(params: { rigProjectId?: string; gitUrl?: string }): Promise<{
     projectId: string;
     name: string;
   }> {
@@ -1829,7 +1968,7 @@ export default async function plugin(bb: BbPluginApi) {
       const created = await createRig({ gitUrl: params.gitUrl });
       return { projectId: created.projectId, name: created.name };
     }
-    throw new Error("Give the patrol a target: rigProjectId of a registered rig, or gitUrl to find or create one.");
+    throw new Error("Give the target: rigProjectId of a registered rig, or gitUrl to find or create one.");
   }
 
   function patrolActive(role: PatrolRole, projectId: string): boolean {
@@ -1848,7 +1987,7 @@ export default async function plugin(bb: BbPluginApi) {
     if (!mayorRow()) {
       throw new Error("No Mayor thread is running; start the Mayor first (bb madmax start).");
     }
-    const target = await resolvePatrolTarget(options);
+    const target = await resolveRigTarget(options);
     if (patrolActive(role, target.projectId)) {
       return { skipped: true as const, projectId: target.projectId, name: target.name };
     }
@@ -2422,6 +2561,41 @@ export default async function plugin(bb: BbPluginApi) {
     },
   });
 
+  bb.agents.registerTool({
+    name: "town_adopt",
+    description: "Adopt an existing bb thread into the town — bring pre-madmax work under management as a polecat (optionally owning a ledger bead), or make an existing thread the new Mayor.",
+    parameters: adoptParams,
+    async execute(params, context) {
+      const caller = context.threadId ? roles.get(context.threadId) : undefined;
+      if (!caller || caller.role !== "mayor" || ["complete", "archived", "deleted"].includes(caller.state)) {
+        throw new Error("town_adopt requires an active registered Mayor thread.");
+      }
+      const result = await adoptThread(params);
+      return [
+        `Adopted thread ${result.threadId} as ${result.role}${result.beadId ? ` (bead ${result.beadId})` : ""}.`,
+        result.role === "mayor"
+          ? "The previous Mayor is retired; its polecats and pending alerts now report to this thread."
+          : "It now files in the Town section, reports through polecat_report, and appears on the roster.",
+      ].join("\n");
+    },
+  });
+  bb.agents.registerTool({
+    name: "town_adopt_pr",
+    description: "Adopt a pull request created outside the town: finds or creates the rig, mints a dedicated bead, and spawns a maintainer polecat that keeps CI green and addresses review feedback. Posting comments and merging stay owner-approved.",
+    parameters: adoptPrParams,
+    async execute(params, context) {
+      const caller = context.threadId ? roles.get(context.threadId) : undefined;
+      if (!caller || caller.role !== "mayor" || ["complete", "archived", "deleted"].includes(caller.state)) {
+        throw new Error("town_adopt_pr requires an active registered Mayor thread.");
+      }
+      const result = await adoptPr(params);
+      return [
+        `Adopted PR ${result.pr} for maintenance (bead ${result.beadId}, maintainer thread ${result.threadId}).`,
+        "When it reports: relay anything the owner must decide. Comments, approvals, and the merge stay owner-approved.",
+      ].join("\n");
+    },
+  });
+
   bb.agents.configure((context) => {
     const row = roles.get(context.thread.id);
     const role = row?.role ?? (context.pluginMetadata.role === "mayor" || context.pluginMetadata.role === "polecat" || context.pluginMetadata.role === "reviewer"
@@ -2433,7 +2607,7 @@ export default async function plugin(bb: BbPluginApi) {
     const rules = row ? (rulesCache.get(row.project_id) ?? BUILT_IN_RULES) : BUILT_IN_RULES;
     if (role === "mayor") {
       return {
-        tools: ["town_sling", "town_roster", "town_inspect", "town_nudge", "town_convoy", "town_ready", "town_complete", "town_review", "town_verify", "town_land", "town_create_rig", "town_pr_review", "town_buzzard", "town_imperator"],
+        tools: ["town_sling", "town_roster", "town_inspect", "town_nudge", "town_convoy", "town_ready", "town_complete", "town_review", "town_verify", "town_land", "town_create_rig", "town_pr_review", "town_buzzard", "town_imperator", "town_adopt", "town_adopt_pr"],
         skills: ["mayor"],
         instructions: `You are the registered Mayor supervising the town's polecat threads from ${context.project.name}. Decompose goals into convoys (town_convoy), sling beads to polecats (town_sling), and drive work through verification (town_verify, town_review) and delivery (town_land) to verified completion (town_complete).\n\n${rules}`,
       };
@@ -2518,6 +2692,9 @@ export default async function plugin(bb: BbPluginApi) {
     "  bb madmax buzzard --git-url <url> [--unmaintained] [--json]",
     "  bb madmax imperator --rig <project-id> [--json]",
     "  bb madmax imperator --git-url <url> [--json]",
+    "  bb madmax adopt --thread <thread-id> [--role mayor|polecat] [--bead <bead-id>] [--json]",
+    "  bb madmax adopt-pr --git-url <url> --pr <number> [--json]",
+    "  bb madmax adopt-pr --rig <project-id> --pr <number> [--json]",
   ].join("\n");
 
   bb.cli.register({
@@ -2537,6 +2714,8 @@ export default async function plugin(bb: BbPluginApi) {
       { name: "land", summary: "Deliver: commit, push the branch, bead to review", usage: "bb madmax land <thread-id>" },
       { name: "buzzard", summary: "Dispatch a Buzzard cruft sweep to a rig", usage: "bb madmax buzzard --rig <project-id> | --git-url <url> [--unmaintained] [--json]" },
       { name: "imperator", summary: "Dispatch an Imperator security patrol to a rig", usage: "bb madmax imperator --rig <project-id> | --git-url <url> [--json]" },
+      { name: "adopt", summary: "Adopt an existing thread into the town", usage: "bb madmax adopt --thread <thread-id> [--role mayor|polecat] [--bead <bead-id>] [--json]" },
+      { name: "adopt-pr", summary: "Adopt an external pull request for town maintenance", usage: "bb madmax adopt-pr --git-url <url> --pr <n> | --rig <project-id> --pr <n> [--json]" },
     ],
     async run(argv: string[], context: PluginCliContext): Promise<PluginCliResult> {
       const [command, ...rest] = argv;
@@ -2683,6 +2862,27 @@ export default async function plugin(bb: BbPluginApi) {
           const threadId = args.positional[0];
           if (!threadId) return fail("land requires <thread-id>");
           return ok({ threadId }, await land(threadId));
+        }
+        if (command === "adopt") {
+          const threadId = args.one("thread");
+          if (!threadId) return fail("adopt requires --thread <thread-id>");
+          const role = args.one("role");
+          if (role !== undefined && role !== "mayor" && role !== "polecat") return fail("--role must be mayor or polecat");
+          const result = await adoptThread({ threadId, role, beadId: args.one("bead") });
+          return ok(
+            result,
+            `Adopted ${result.threadId} as ${result.role}${result.beadId ? ` (bead ${result.beadId})` : ""}.`,
+          );
+        }
+        if (command === "adopt-pr") {
+          const prNumber = Number(args.one("pr"));
+          if (!Number.isInteger(prNumber) || prNumber < 1) return fail("adopt-pr requires --pr <number>");
+          const gitUrl = args.one("git-url");
+          const rigProjectId = args.one("rig");
+          if (!gitUrl && !rigProjectId) return fail("adopt-pr requires --git-url <url> or --rig <project-id>");
+          await ensureMayor();
+          const result = await adoptPr({ ...(gitUrl ? { gitUrl } : {}), ...(rigProjectId ? { rigProjectId } : {}), prNumber });
+          return ok(result, `Adopted PR ${result.pr} for maintenance (bead ${result.beadId}, thread ${result.threadId}).`);
         }
         if (command === "buzzard" || command === "imperator") {
           const rigProjectId = args.one("rig");
