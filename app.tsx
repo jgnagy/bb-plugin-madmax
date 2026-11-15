@@ -172,53 +172,79 @@ function timeAgo(at: number): string {
   return `${Math.round(hours / 24)}d ago`;
 }
 
-const BEAD_STATE_STYLES: Record<string, string> = {
-  ready: "text-emerald-600 dark:text-emerald-400",
-  blocked: "text-destructive",
-  in_progress: "text-foreground",
-  review: "text-amber-600 dark:text-amber-400",
-  closed: "text-muted-foreground line-through",
-};
+/** The town's pipeline: a card sits in the column its stage earned. */
+type Stage = "blocked" | "ready" | "flight" | "review" | "landed";
 
-function BeadRow({ bead }: { bead: BoardBead }) {
-  const blocked = bead.status === "open" && !bead.ready;
-  const style =
-    BEAD_STATE_STYLES[bead.status] ??
-    (bead.ready ? BEAD_STATE_STYLES.ready : blocked ? BEAD_STATE_STYLES.blocked : "");
-  const state = bead.status === "open" ? (bead.ready ? "ready" : "blocked") : bead.status;
+function stageOf(bead: BoardBead): Stage {
+  if (bead.status === "closed") return "landed";
+  if (bead.status === "review") return "review";
+  if (bead.status === "in_progress") return "flight";
+  return bead.ready ? "ready" : "blocked";
+}
+
+const KANBAN_COLUMNS: { key: Stage; label: string; accent: string }[] = [
+  { key: "blocked", label: "Blocked", accent: "text-destructive" },
+  { key: "ready", label: "Ready", accent: "text-emerald-600 dark:text-emerald-400" },
+  { key: "flight", label: "In flight", accent: "text-foreground" },
+  { key: "review", label: "In review", accent: "text-amber-600 dark:text-amber-400" },
+  { key: "landed", label: "Landed", accent: "text-muted-foreground" },
+];
+
+function BeadCard({ bead, origin }: { bead: BoardBead; origin?: string }) {
   return (
-    <li className="flex items-baseline gap-2 px-2 py-1.5 text-sm">
-      <span className={`w-20 shrink-0 text-xs font-medium uppercase ${style}`}>{state}</span>
-      <span className="min-w-0 flex-1 truncate">{bead.title}</span>
+    <div className="rounded-md border border-border bg-card px-2 py-1.5 text-xs" title={bead.id}>
+      {origin ? (
+        <p className="mb-0.5 truncate text-[11px] font-medium text-muted-foreground/80">{origin}</p>
+      ) : null}
+      <p className="line-clamp-2 leading-snug">{bead.title}</p>
       {bead.labels?.length ? (
-        <span className="hidden shrink-0 text-xs text-muted-foreground sm:inline">
-          {bead.labels.join(" · ")}
-        </span>
+        <p className="mt-0.5 truncate text-[11px] text-muted-foreground">{bead.labels.join(" · ")}</p>
       ) : null}
       {bead.threadId !== null ? (
-        <span className="w-28 shrink-0 truncate text-right text-xs text-muted-foreground" title={bead.threadId}>
-          {bead.threadState ?? "thread"} · {bead.threadId.slice(0, 12)}
-        </span>
+        <p className="mt-0.5 truncate text-[11px] text-muted-foreground" title={bead.threadId}>
+          thread: {bead.threadState ?? "?"} · {bead.threadId.slice(0, 12)}
+        </p>
       ) : null}
-    </li>
+    </div>
+  );
+}
+
+function KanbanColumns({ beads }: { beads: (BoardBead & { origin?: string })[] }) {
+  const priorityOf = (bead: BoardBead) => (typeof bead.priority === "number" ? bead.priority : 99);
+  return (
+    <div className="grid grid-cols-2 gap-2 sm:grid-cols-3 lg:grid-cols-5">
+      {KANBAN_COLUMNS.map((column) => {
+        const columnBeads = beads
+          .filter((bead) => stageOf(bead) === column.key)
+          .sort((a, b) => priorityOf(a) - priorityOf(b) || a.title.localeCompare(b.title));
+        return (
+          <div key={column.key} className="min-w-0 space-y-1 rounded-md border border-border/60 bg-muted/30 p-1.5">
+            <p className={`px-1 text-[11px] font-semibold uppercase tracking-wide ${column.accent}`}>
+              {column.label} {columnBeads.length > 0 ? `· ${columnBeads.length}` : ""}
+            </p>
+            {columnBeads.length === 0 ? (
+              <p className="px-1 py-0.5 text-[11px] text-muted-foreground/60">—</p>
+            ) : (
+              columnBeads.map((bead) => <BeadCard key={bead.id} bead={bead} origin={bead.origin} />)
+            )}
+          </div>
+        );
+      })}
+    </div>
   );
 }
 
 function ConvoyCard({ convoy }: { convoy: TownConvoy }) {
   return (
-    <div className="rounded-lg border border-border bg-card px-3 py-2">
-      <div className="flex items-baseline justify-between gap-2 px-1 pb-1">
+    <div className="space-y-2 rounded-lg border border-border bg-card px-3 py-2">
+      <div className="flex items-baseline justify-between gap-2 px-1">
         <p className="min-w-0 truncate font-medium">{convoy.title}</p>
         <span className="shrink-0 font-mono text-xs text-muted-foreground">{convoy.id}</span>
       </div>
       {convoy.beads.length === 0 ? (
         <p className="px-2 py-1.5 text-sm text-muted-foreground">No beads yet.</p>
       ) : (
-        <ul className="divide-y divide-border/60">
-          {convoy.beads.map((bead) => (
-            <BeadRow key={bead.id} bead={bead} />
-          ))}
-        </ul>
+        <KanbanColumns beads={convoy.beads} />
       )}
     </div>
   );
@@ -228,6 +254,7 @@ function TownHallPage() {
   const rpc = useRpc<typeof rpcContract>();
   const [data, setData] = useState<TownHallData | null>(null);
   const [error, setError] = useState<string | null>(null);
+  const [boardView, setBoardView] = useState<"pipeline" | "convoys">("pipeline");
   const refetch = useCallback(() => {
     rpc.call("townHall", null).then((result) => {
       setData(result);
@@ -311,9 +338,42 @@ function TownHallPage() {
             ) : null}
 
             <section className="space-y-2">
-              <h2 className="text-xs font-semibold uppercase tracking-wide text-muted-foreground">
-                Convoys
-              </h2>
+              <div className="flex flex-wrap items-baseline justify-between gap-2">
+                <div className="flex items-center gap-2">
+                  <h2 className="text-xs font-semibold uppercase tracking-wide text-muted-foreground">
+                    {boardView === "pipeline" ? "Pipeline" : "Convoys"}
+                  </h2>
+                  <div className="flex gap-1">
+                    <button
+                      type="button"
+                      aria-pressed={boardView === "pipeline"}
+                      className={`rounded-md border px-2 py-0.5 text-[11px] font-medium ${
+                        boardView === "pipeline"
+                          ? "border-primary/40 bg-primary/10 text-foreground"
+                          : "border-border text-muted-foreground hover:bg-state-hover"
+                      }`}
+                      onClick={() => setBoardView("pipeline")}
+                    >
+                      Town pipeline
+                    </button>
+                    <button
+                      type="button"
+                      aria-pressed={boardView === "convoys"}
+                      className={`rounded-md border px-2 py-0.5 text-[11px] font-medium ${
+                        boardView === "convoys"
+                          ? "border-primary/40 bg-primary/10 text-foreground"
+                          : "border-border text-muted-foreground hover:bg-state-hover"
+                      }`}
+                      onClick={() => setBoardView("convoys")}
+                    >
+                      By convoy
+                    </button>
+                  </div>
+                </div>
+                <p className="text-[11px] text-muted-foreground/80">
+                  Read-only — stages change through the Mayor's tools
+                </p>
+              </div>
               {data.convoys.length === 0 && data.looseBeads.length === 0 ? (
                 <p className="text-sm text-muted-foreground">
                   {data.status.ledger?.initialized
@@ -322,21 +382,26 @@ function TownHallPage() {
                       ? "Ledger not initialized — run: bb madmax ledger init"
                       : "bd (Beads) is not installed on the bb server machine."}
                 </p>
+              ) : boardView === "pipeline" ? (
+                <KanbanColumns
+                  beads={[
+                    ...data.convoys.flatMap((convoy) =>
+                      convoy.beads.map((bead) => ({ ...bead, origin: convoy.title })),
+                    ),
+                    ...data.looseBeads.map((bead) => ({ ...bead, origin: "Loose" })),
+                  ]}
+                />
               ) : (
                 <div className="space-y-3">
                   {data.convoys.map((convoy) => (
                     <ConvoyCard key={convoy.id} convoy={convoy} />
                   ))}
                   {data.looseBeads.length > 0 ? (
-                    <div className="rounded-lg border border-border bg-card px-3 py-2">
-                      <p className="px-1 pb-1 text-xs font-medium uppercase tracking-wide text-muted-foreground">
+                    <div className="space-y-2 rounded-lg border border-border bg-card px-3 py-2">
+                      <p className="px-1 text-xs font-medium uppercase tracking-wide text-muted-foreground">
                         Loose beads (no convoy)
                       </p>
-                      <ul className="divide-y divide-border/60">
-                        {data.looseBeads.map((bead) => (
-                          <BeadRow key={bead.id} bead={bead} />
-                        ))}
-                      </ul>
+                      <KanbanColumns beads={data.looseBeads} />
                     </div>
                   ) : null}
                 </div>

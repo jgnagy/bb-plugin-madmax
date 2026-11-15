@@ -60,9 +60,12 @@ the bead to review. Merges, PRs to default branches, and anything
 irreversible stay yours.
 
 **Town Hall.** A sidebar page with the town problems-first: blocked and
-failed threads under "Needs attention", the convoy board with each bead's
-ready/blocked/running state and linked polecat, the live roster, and an
-activity feed of everything that happened — all updating in real time.
+failed threads under "Needs attention", and a task board that mirrors the
+pipeline — every bead from every convoy in Blocked / Ready / In flight /
+In review / Landed columns, or grouped by convoy, each card showing its
+labels and linked polecat. A live roster and an activity feed sit
+underneath, all updating in real time. The board is read-only by design:
+stages are earned through the Mayor's tools, never by dragging.
 
 **A deterministic Deacon.** A background supervisor watches thread
 lifecycle events, repairs state from live data, detects stalls, keeps claim
