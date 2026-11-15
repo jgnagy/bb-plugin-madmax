@@ -32,6 +32,15 @@ type TownStatus = {
   mayor: ManagedThread | null;
   threads: ManagedThread[];
   rigs: Rig[];
+  ledger: {
+    bdAvailable: boolean;
+    initialized: boolean;
+    path: string | null;
+    open: number;
+    inProgress: number;
+    ready: number;
+    convoys: number;
+  } | null;
 };
 
 const PROBLEM_STATES = new Set(["blocked", "failed"]);
@@ -118,6 +127,15 @@ function TownSection({ projectId }: { projectId: string | null }) {
               {status.rigs.length > 0 ? (
                 <> · rigs: {status.rigs.map((rig) => rig.name).join(", ")}</>
               ) : null}
+            </p>
+          ) : null}
+          {status !== null && status.ledger !== null ? (
+            <p className="text-xs text-muted-foreground">
+              {status.ledger.bdAvailable
+                ? status.ledger.initialized
+                  ? `Ledger: ${status.ledger.open} open · ${status.ledger.ready} ready · ${status.ledger.convoys} convoys`
+                  : "Ledger: not initialized — run: bb madmax ledger init"
+                : "Ledger: bd (Beads) not installed on the bb server machine"}
             </p>
           ) : null}
         </div>
@@ -312,8 +330,10 @@ function TownOnboarding() {
     <div className="rounded-lg border border-border bg-card text-card-foreground">
       <div className="space-y-3 px-6 py-4 text-sm">
         <p className="text-foreground">
-          Welcome to your town. Choose the bb project that holds the Mayor and
-          the town ledger.
+          Welcome to your town. Pick an existing project to import a town that
+          already lives there — or create a dedicated folder below, which is
+          how most towns start (it gets a git repo, a Beads ledger, and a
+          rules starter).
         </p>
         {error !== null ? (
           <p role="alert" className="text-destructive">
@@ -324,51 +344,57 @@ function TownOnboarding() {
           <p className="text-muted-foreground">Loading your projects…</p>
         ) : projects.length === 0 ? (
           <p className="text-muted-foreground">
-            No bb projects yet — register a folder as your town below, or create
-            a project in bb first.
+            No bb projects to import — start your town with a new folder below.
           </p>
         ) : (
-          <ul className="flex flex-wrap gap-2">
-            {projects.map((project) => (
-              <li key={project.projectId}>
-                <Button
-                  variant="outline"
-                  disabled={busy !== null}
-                  onClick={() => void choose(project.projectId)}
-                >
-                  {busy === project.projectId ? "Starting…" : project.name}
-                </Button>
-              </li>
-            ))}
-          </ul>
+          <div className="space-y-2">
+            <p className="text-xs font-medium text-muted-foreground">
+              Import a town from an existing bb project:
+            </p>
+            <ul className="flex flex-wrap gap-2">
+              {projects.map((project) => (
+                <li key={project.projectId}>
+                  <Button
+                    variant="outline"
+                    disabled={busy !== null}
+                    onClick={() => void choose(project.projectId)}
+                  >
+                    {busy === project.projectId ? "Starting…" : project.name}
+                  </Button>
+                </li>
+              ))}
+            </ul>
+          </div>
         )}
-        <div className="flex flex-wrap items-center gap-2 border-t border-border pt-3">
-          <span className="text-muted-foreground">
+        <div className="space-y-2 border-t border-border pt-3">
+          <p className="text-sm text-muted-foreground">
             Or a new town folder (created if missing):
-          </span>
-          <Input
-            value={name}
-            onChange={(event) => setName(event.target.value)}
-            placeholder="Town name"
-            aria-label="New town name"
-            className="w-40"
-          />
-          <Input
-            value={path}
-            onChange={(event) => setPath(event.target.value)}
-            placeholder="/path/to/town"
-            aria-label="New town folder path"
-            className="w-56"
-          />
-          <Button
-            variant="outline"
-            size="icon"
-            aria-label="Browse folders"
-            disabled={busy !== null}
-            onClick={() => setBrowseOpen(true)}
-          >
-            <Icon name="FolderOpen" className="size-4" />
-          </Button>
+          </p>
+          <div className="flex flex-wrap items-center gap-2">
+            <Input
+              value={name}
+              onChange={(event) => setName(event.target.value)}
+              placeholder="Town name"
+              aria-label="New town name"
+              className="w-40"
+            />
+            <Input
+              value={path}
+              onChange={(event) => setPath(event.target.value)}
+              placeholder="/path/to/town"
+              aria-label="New town folder path"
+              className="min-w-56 flex-1"
+            />
+            <Button
+              variant="outline"
+              size="icon"
+              aria-label="Browse folders"
+              disabled={busy !== null}
+              onClick={() => setBrowseOpen(true)}
+            >
+              <Icon name="FolderOpen" className="size-4" />
+            </Button>
+          </div>
           <Button
             variant="outline"
             disabled={busy !== null || name.trim() === "" || path.trim() === ""}
