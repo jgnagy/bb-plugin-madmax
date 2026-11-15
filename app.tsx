@@ -12,7 +12,7 @@ import {
   useRpc,
 } from "@get-bb/plugin-sdk/app";
 import type { PluginSidebarThread } from "@get-bb/plugin-sdk/app";
-import type { ManagedThread, Rig, rpcContract } from "./server";
+import type { ManagedThread, Rig, rpcContract, BoardBead, TownEvent } from "./server";
 import { Button } from "@/components/ui/button";
 import { Icon } from "@/components/ui/icon";
 import { Input } from "@/components/ui/input";
@@ -152,6 +152,259 @@ function TownSection({ projectId }: { projectId: string | null }) {
 }
 
 type TownProjectChoice = { projectId: string; name: string; kind: string };
+
+type TownConvoy = { id: string; title: string; status: string; beads: BoardBead[] };
+
+type TownHallData = {
+  status: TownStatus;
+  convoys: TownConvoy[];
+  looseBeads: BoardBead[];
+  events: TownEvent[];
+};
+
+function timeAgo(at: number): string {
+  const seconds = Math.max(0, Math.round((Date.now() - at) / 1_000));
+  if (seconds < 60) return `${seconds}s ago`;
+  const minutes = Math.round(seconds / 60);
+  if (minutes < 60) return `${minutes}m ago`;
+  const hours = Math.round(minutes / 60);
+  if (hours < 24) return `${hours}h ago`;
+  return `${Math.round(hours / 24)}d ago`;
+}
+
+const BEAD_STATE_STYLES: Record<string, string> = {
+  ready: "text-emerald-600 dark:text-emerald-400",
+  blocked: "text-destructive",
+  in_progress: "text-foreground",
+  review: "text-amber-600 dark:text-amber-400",
+  closed: "text-muted-foreground line-through",
+};
+
+function BeadRow({ bead }: { bead: BoardBead }) {
+  const blocked = bead.status === "open" && !bead.ready;
+  const style =
+    BEAD_STATE_STYLES[bead.status] ??
+    (bead.ready ? BEAD_STATE_STYLES.ready : blocked ? BEAD_STATE_STYLES.blocked : "");
+  const state = bead.status === "open" ? (bead.ready ? "ready" : "blocked") : bead.status;
+  return (
+    <li className="flex items-baseline gap-2 px-2 py-1.5 text-sm">
+      <span className={`w-20 shrink-0 text-xs font-medium uppercase ${style}`}>{state}</span>
+      <span className="min-w-0 flex-1 truncate">{bead.title}</span>
+      {bead.labels?.length ? (
+        <span className="hidden shrink-0 text-xs text-muted-foreground sm:inline">
+          {bead.labels.join(" · ")}
+        </span>
+      ) : null}
+      {bead.threadId !== null ? (
+        <span className="w-28 shrink-0 truncate text-right text-xs text-muted-foreground" title={bead.threadId}>
+          {bead.threadState ?? "thread"} · {bead.threadId.slice(0, 12)}
+        </span>
+      ) : null}
+    </li>
+  );
+}
+
+function ConvoyCard({ convoy }: { convoy: TownConvoy }) {
+  return (
+    <div className="rounded-lg border border-border bg-card px-3 py-2">
+      <div className="flex items-baseline justify-between gap-2 px-1 pb-1">
+        <p className="min-w-0 truncate font-medium">{convoy.title}</p>
+        <span className="shrink-0 font-mono text-xs text-muted-foreground">{convoy.id}</span>
+      </div>
+      {convoy.beads.length === 0 ? (
+        <p className="px-2 py-1.5 text-sm text-muted-foreground">No beads yet.</p>
+      ) : (
+        <ul className="divide-y divide-border/60">
+          {convoy.beads.map((bead) => (
+            <BeadRow key={bead.id} bead={bead} />
+          ))}
+        </ul>
+      )}
+    </div>
+  );
+}
+
+function TownHallPage() {
+  const rpc = useRpc<typeof rpcContract>();
+  const [data, setData] = useState<TownHallData | null>(null);
+  const [error, setError] = useState<string | null>(null);
+  const refetch = useCallback(() => {
+    rpc.call("townHall", null).then((result) => {
+      setData(result);
+      setError(null);
+    }, (cause: unknown) => {
+      setError(cause instanceof Error ? cause.message : String(cause));
+    });
+  }, [rpc]);
+  useEffect(() => {
+    refetch();
+  }, [refetch]);
+  useRealtime("town-changed", refetch);
+
+  if (data !== null && data.status.townProjectId === null && data.status.mayor === null) {
+    return (
+      <div className="mx-auto box-border w-full max-w-3xl px-4 pb-4 pt-3 md:px-5 md:pt-4">
+        <TownOnboarding />
+      </div>
+    );
+  }
+
+  const problems =
+    data?.status.threads.filter(
+      (thread) => thread.role !== "mayor" && PROBLEM_STATES.has(thread.state),
+    ) ?? [];
+  const roster =
+    data?.status.threads
+      .filter((thread) => thread.role !== "mayor" && thread.state !== "complete")
+      .sort((a, b) => a.state.localeCompare(b.state) || a.title.localeCompare(b.title)) ?? [];
+
+  return (
+    <div className="h-full min-h-0 flex-1 overflow-y-auto">
+      <div className="mx-auto box-border w-full max-w-3xl space-y-5 px-4 pb-6 pt-3 md:px-5 md:pt-4">
+        {error !== null ? (
+          <p role="alert" className="text-sm text-destructive">
+            {error}
+          </p>
+        ) : null}
+
+        {data === null ? (
+          <p className="text-sm text-muted-foreground">Opening the town hall…</p>
+        ) : (
+          <>
+            <div className="flex items-baseline justify-between gap-3">
+              <p className="text-sm">
+                {data.status.mayor
+                  ? `${data.status.mayor.title} — ${data.status.mayor.state}`
+                  : data.status.townProjectId
+                    ? "Town set, no Mayor running — bb madmax start"
+                    : ""}
+              </p>
+              {data.status.ledger !== null && data.status.ledger.initialized ? (
+                <p className="shrink-0 text-xs text-muted-foreground">
+                  {data.status.ledger.open} open · {data.status.ledger.ready} ready ·{" "}
+                  {data.status.ledger.inProgress} running · {data.status.ledger.convoys} convoys
+                </p>
+              ) : null}
+            </div>
+
+            {problems.length > 0 ? (
+              <section className="space-y-2">
+                <h2 className="text-xs font-semibold uppercase tracking-wide text-destructive">
+                  Needs attention
+                </h2>
+                <ul className="divide-y divide-border overflow-hidden rounded-lg border border-border bg-card px-3">
+                  {problems.map((thread) => (
+                    <li key={thread.threadId} className="flex items-baseline gap-2 py-2 text-sm">
+                      <span className="w-20 shrink-0 text-xs font-medium uppercase text-destructive">
+                        {thread.state}
+                      </span>
+                      <span className="min-w-0 flex-1 truncate">{thread.title}</span>
+                      {thread.blocker !== null ? (
+                        <span className="max-w-[40%] truncate text-xs text-muted-foreground" title={thread.blocker}>
+                          {thread.blocker}
+                        </span>
+                      ) : null}
+                    </li>
+                  ))}
+                </ul>
+              </section>
+            ) : null}
+
+            <section className="space-y-2">
+              <h2 className="text-xs font-semibold uppercase tracking-wide text-muted-foreground">
+                Convoys
+              </h2>
+              {data.convoys.length === 0 && data.looseBeads.length === 0 ? (
+                <p className="text-sm text-muted-foreground">
+                  {data.status.ledger?.initialized
+                    ? "No convoys in the ledger yet — the Mayor creates them with town_convoy."
+                    : data.status.ledger?.bdAvailable
+                      ? "Ledger not initialized — run: bb madmax ledger init"
+                      : "bd (Beads) is not installed on the bb server machine."}
+                </p>
+              ) : (
+                <div className="space-y-3">
+                  {data.convoys.map((convoy) => (
+                    <ConvoyCard key={convoy.id} convoy={convoy} />
+                  ))}
+                  {data.looseBeads.length > 0 ? (
+                    <div className="rounded-lg border border-border bg-card px-3 py-2">
+                      <p className="px-1 pb-1 text-xs font-medium uppercase tracking-wide text-muted-foreground">
+                        Loose beads (no convoy)
+                      </p>
+                      <ul className="divide-y divide-border/60">
+                        {data.looseBeads.map((bead) => (
+                          <BeadRow key={bead.id} bead={bead} />
+                        ))}
+                      </ul>
+                    </div>
+                  ) : null}
+                </div>
+              )}
+            </section>
+
+            <section className="space-y-2">
+              <h2 className="text-xs font-semibold uppercase tracking-wide text-muted-foreground">
+                Roster
+              </h2>
+              {roster.length === 0 ? (
+                <p className="text-sm text-muted-foreground">
+                  No managed threads — the Mayor slings work with town_sling.
+                </p>
+              ) : (
+                <ul className="divide-y divide-border overflow-hidden rounded-lg border border-border bg-card px-3">
+                  {roster.map((thread) => (
+                    <li key={thread.threadId} className="flex items-baseline gap-2 py-2 text-sm">
+                      <span className="w-20 shrink-0 text-xs font-medium uppercase text-muted-foreground">
+                        {thread.role === "polecat" ? thread.tier ?? "polecat" : thread.role}
+                      </span>
+                      <span
+                        className={`w-16 shrink-0 text-xs font-medium uppercase ${
+                          PROBLEM_STATES.has(thread.state) ? "text-destructive" : "text-muted-foreground"
+                        }`}
+                      >
+                        {thread.state}
+                      </span>
+                      <span className="min-w-0 flex-1 truncate">{thread.title}</span>
+                      {thread.beadId !== null ? (
+                        <span className="shrink-0 font-mono text-xs text-muted-foreground">
+                          {thread.beadId}
+                        </span>
+                      ) : null}
+                    </li>
+                  ))}
+                </ul>
+              )}
+            </section>
+
+            <section className="space-y-2">
+              <h2 className="text-xs font-semibold uppercase tracking-wide text-muted-foreground">
+                Activity
+              </h2>
+              {data.events.length === 0 ? (
+                <p className="text-sm text-muted-foreground">Quiet so far.</p>
+              ) : (
+                <ul className="space-y-1">
+                  {data.events.slice(0, 30).map((event, index) => (
+                    <li key={`${event.at}-${index}`} className="flex items-baseline gap-2 text-sm">
+                      <span className="w-14 shrink-0 text-xs text-muted-foreground">
+                        {timeAgo(event.at)}
+                      </span>
+                      <span className="w-16 shrink-0 text-xs font-medium text-muted-foreground">
+                        {event.kind}
+                      </span>
+                      <span className="min-w-0 flex-1">{event.message}</span>
+                    </li>
+                  ))}
+                </ul>
+              )}
+            </section>
+          </>
+        )}
+      </div>
+    </div>
+  );
+}
 
 type DirectoryBrowse = {
   hostId: string;
@@ -461,6 +714,13 @@ function TownRowBadge({
 }
 
 export default definePluginApp((app) => {
+  app.slots.navPanel({
+    id: "town-hall",
+    title: "Town Hall",
+    icon: "Landmark",
+    path: "town-hall",
+    component: TownHallPage,
+  });
   app.slots.homepageSection({
     id: "madmax-town",
     title: "Madmax",

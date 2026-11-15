@@ -149,27 +149,52 @@ const completeParams = z.object({
   result: z.string().trim().max(MAX_RESULT_LENGTH).optional().describe("The verified outcome recorded on the bead."),
 });
 
+const boardBeadSchema = z.object({
+  id: z.string(),
+  title: z.string(),
+  status: z.string(),
+  priority: z.union([z.number(), z.string()]).nullable(),
+  labels: z.array(z.string()).nullable(),
+  ready: z.boolean(),
+  threadId: z.string().nullable(),
+  threadState: z.string().nullable(),
+}).strict();
+export type BoardBead = z.infer<typeof boardBeadSchema>;
+
+type BoardConvoy = { id: string; title: string; status: string; beads: BoardBead[] };
+
+const townEventSchema = z.object({
+  at: z.number(),
+  kind: z.string(),
+  message: z.string(),
+  threadId: z.string().nullable(),
+  beadId: z.string().nullable(),
+}).strict();
+export type TownEvent = z.infer<typeof townEventSchema>;
+
+const statusOutputSchema = z.object({
+  sectionId: z.string().nullable(),
+  townProjectId: z.string().nullable(),
+  mayor: managedThreadSchema.nullable(),
+  threads: z.array(managedThreadSchema),
+  rigs: z.array(rigSchema),
+  ledger: z
+    .object({
+      bdAvailable: z.boolean(),
+      initialized: z.boolean(),
+      path: z.string().nullable(),
+      open: z.number(),
+      inProgress: z.number(),
+      ready: z.number(),
+      convoys: z.number(),
+    })
+    .nullable(),
+});
+
 export const rpcContract = defineRpcContract({
   status: {
     input: z.null(),
-    output: z.object({
-      sectionId: z.string().nullable(),
-      townProjectId: z.string().nullable(),
-      mayor: managedThreadSchema.nullable(),
-      threads: z.array(managedThreadSchema),
-      rigs: z.array(rigSchema),
-      ledger: z
-        .object({
-          bdAvailable: z.boolean(),
-          initialized: z.boolean(),
-          path: z.string().nullable(),
-          open: z.number(),
-          inProgress: z.number(),
-          ready: z.number(),
-          convoys: z.number(),
-        })
-        .nullable(),
-    }),
+    output: statusOutputSchema,
   },
   start: {
     input: z.object({ projectId: z.string().trim().min(1).nullable() }).strict(),
@@ -218,6 +243,24 @@ export const rpcContract = defineRpcContract({
   ledgerInit: {
     input: z.object({}).strict(),
     output: z.object({ initialized: z.boolean(), path: z.string() }).strict(),
+  },
+  townHall: {
+    input: z.null(),
+    output: z.object({
+      status: statusOutputSchema,
+      convoys: z.array(
+        z
+          .object({
+            id: z.string(),
+            title: z.string(),
+            status: z.string(),
+            beads: z.array(boardBeadSchema),
+          })
+          .strict(),
+      ),
+      looseBeads: z.array(boardBeadSchema),
+      events: z.array(townEventSchema),
+    }),
   },
 });
 
@@ -394,6 +437,14 @@ export default async function plugin(bb: BbPluginApi) {
       created_at INTEGER NOT NULL
     )`,
     `CREATE INDEX IF NOT EXISTS alert_outbox_pending ON alert_outbox (delivered_at, created_at)`,
+    `CREATE TABLE IF NOT EXISTS town_events (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      at INTEGER NOT NULL,
+      kind TEXT NOT NULL,
+      message TEXT NOT NULL,
+      thread_id TEXT,
+      bead_id TEXT
+    )`,
   ]);
 
   const allRows = db.prepare(`SELECT * FROM town_threads ORDER BY created_at ASC`);
@@ -421,6 +472,25 @@ export default async function plugin(bb: BbPluginApi) {
 
   function publishTown() {
     bb.realtime.publish(REALTIME_CHANNEL, null);
+  }
+
+  /** The town's activity feed — one row per thing worth having seen. */
+  function logEvent(kind: string, message: string, threadId?: string | null, beadId?: string | null) {
+    db.prepare(`INSERT INTO town_events (at, kind, message, thread_id, bead_id) VALUES (?, ?, ?, ?, ?)`)
+      .run(Date.now(), kind, clip(message, MAX_ALERT_LENGTH), threadId ?? null, beadId ?? null);
+    publishTown();
+  }
+
+  function recentEvents(limit = 50): TownEvent[] {
+    const rows = db.prepare(`SELECT at, kind, message, thread_id, bead_id FROM town_events ORDER BY id DESC LIMIT ?`)
+      .all(limit) as { at: number; kind: string; message: string; thread_id: string | null; bead_id: string | null }[];
+    return rows.map((row) => ({
+      at: row.at,
+      kind: row.kind,
+      message: row.message,
+      threadId: row.thread_id,
+      beadId: row.bead_id,
+    }));
   }
 
   function toManaged(row: ManagedRow): ManagedThread {
@@ -550,6 +620,7 @@ export default async function plugin(bb: BbPluginApi) {
       );
     }
     if (!current) await settings.experimental_set({ townProject: projectId });
+    logEvent("town", `Town project set: ${projectId}`);
   }
 
   /** The friendly "where should the town live?" message, with real choices. */
@@ -644,6 +715,7 @@ export default async function plugin(bb: BbPluginApi) {
     }
     await execFileAsync("bd", ["init"], { cwd: path, timeout: BD_TIMEOUT_MS, maxBuffer: 16 * 1024 * 1024 });
     ledgerCache = null;
+    logEvent("ledger", `Ledger initialized at ${path}`);
     return { initialized: true, path };
   }
 
@@ -698,6 +770,56 @@ export default async function plugin(bb: BbPluginApi) {
     return value;
   }
 
+  /** The convoy board: bd epics with their beads, linked to working threads. */
+  async function ledgerBoard(): Promise<{ convoys: BoardConvoy[]; looseBeads: BoardBead[] }> {
+    const empty: { convoys: BoardConvoy[]; looseBeads: BoardBead[] } = { convoys: [], looseBeads: [] };
+    if (!(await configuredTownProject())) return empty;
+    try {
+      if (!(await isBdAvailable())) return empty;
+      if (!existsSync(join(await townLedgerDir(), ".beads"))) return empty;
+      const [issues, readyIssues] = await Promise.all([
+        bdJson<Bead[]>(["list", "--all"]),
+        bdJson<Bead[]>(["ready"]),
+      ]);
+      const readyIds = new Set(readyIssues.map((bead) => bead.id));
+      const rowsByBead = new Map<string, ManagedRow>();
+      for (const row of roles.values()) {
+        if (row.bead_id) rowsByBead.set(row.bead_id, row);
+      }
+      const toBoardBead = (bead: Bead): BoardBead => {
+        const row = rowsByBead.get(bead.id);
+        return {
+          id: bead.id,
+          title: bead.title,
+          status: bead.status,
+          priority: bead.priority ?? null,
+          labels: bead.labels ?? null,
+          ready: readyIds.has(bead.id),
+          threadId: row?.thread_id ?? null,
+          threadState: row?.state ?? null,
+        };
+      };
+      const priorityOf = (bead: BoardBead) => (typeof bead.priority === "number" ? bead.priority : 99);
+      const epics = issues.filter((issue) => issue.issue_type === "epic" && issue.status !== "closed");
+      const convoys = epics.map((epic) => ({
+        id: epic.id,
+        title: epic.title,
+        status: epic.status,
+        beads: issues
+          .filter((issue) => issue.parent === epic.id && issue.issue_type !== "epic")
+          .map(toBoardBead)
+          .sort((a, b) => priorityOf(a) - priorityOf(b) || a.title.localeCompare(b.title)),
+      }));
+      const looseBeads = issues
+        .filter((issue) => !issue.parent && issue.issue_type !== "epic" && issue.status !== "closed")
+        .map(toBoardBead)
+        .sort((a, b) => priorityOf(a) - priorityOf(b) || a.title.localeCompare(b.title));
+      return { convoys, looseBeads };
+    } catch {
+      return empty;
+    }
+  }
+
   async function spawnMayor(target: string, previous?: ManagedRow) {
     const values = await settings.get();
     const sectionId = await ensureSection();
@@ -739,6 +861,7 @@ export default async function plugin(bb: BbPluginApi) {
       reloadRoles();
     }
     insertThread({ threadId: thread.id, role: "mayor", projectId: target, title, state: "starting", status: thread.status });
+    logEvent("mayor", `Mayor started: ${title}`, thread.id);
     return { threadId: thread.id, created: true as const };
   }
 
@@ -825,6 +948,7 @@ export default async function plugin(bb: BbPluginApi) {
       name: input.name,
       source: { type: "local_path", hostId, path },
     });
+    logEvent("town", `Town folder created: ${input.name} at ${path}`);
     const start = await chooseTown(project.id);
     return { projectId: project.id, threadId: start.threadId, created: start.created };
   }
@@ -840,12 +964,14 @@ export default async function plugin(bb: BbPluginApi) {
     const now = Date.now();
     db.prepare(`INSERT INTO rigs (project_id, name, registered_at) VALUES (?, ?, ?)
       ON CONFLICT(project_id) DO UPDATE SET name=excluded.name`).run(projectId, name, now);
+    logEvent("rig", `Rig registered: ${name} (${projectId})`);
     publishTown();
     return { projectId, name, registeredAt: now };
   }
 
   function removeRig(projectId: string) {
     const result = db.prepare(`DELETE FROM rigs WHERE project_id=?`).run(projectId);
+    if (result.changes > 0) logEvent("rig", `Rig removed: ${projectId}`);
     publishTown();
     return result.changes > 0;
   }
@@ -945,6 +1071,12 @@ export default async function plugin(bb: BbPluginApi) {
       mayorThreadId: mayor.thread_id, beadId: bead?.id ?? null, tier, title,
       state: "starting", status: thread.status,
     });
+    logEvent(
+      "sling",
+      `Slung “${title}” to a polecat (tier ${tier}${bead ? `, bead ${bead.id}` : ""})`,
+      thread.id,
+      bead?.id ?? null,
+    );
     return { threadId: thread.id, title, projectId: rigProjectId, tier, beadId: bead?.id ?? null };
   }
 
@@ -957,6 +1089,7 @@ export default async function plugin(bb: BbPluginApi) {
       input: [{ type: "text", text: clip(text, MAX_RESULT_LENGTH), mentions: [] }],
       senderThreadId: row.mayor_thread_id ?? undefined,
     });
+    logEvent("nudge", `Nudged “${row.title}”${steer ? " (steering the running turn)" : ""}`, threadId);
     db.prepare(`UPDATE town_threads SET state='active', blocker=NULL, recommendation=NULL,
       active_since=?, active_cycle=active_cycle+1, stall_alerted_cycle=NULL, updated_at=? WHERE thread_id=?`).run(
       Date.now(), Date.now(), threadId,
@@ -1042,6 +1175,12 @@ export default async function plugin(bb: BbPluginApi) {
     if (!delivered) {
       throw new Error("Report was saved but could not be delivered to the Mayor. It will retry automatically; check Mayor connectivity before reporting again.");
     }
+    logEvent(
+      "report",
+      `${row.role === "reviewer" ? "Reviewer" : "Polecat"} report from “${row.title}”: ${params.state}`,
+      threadId,
+      current.bead_id,
+    );
     // NDI: the ledger is the durable record — reports land on the bead.
     if (current.bead_id) {
       try {
@@ -1100,6 +1239,7 @@ export default async function plugin(bb: BbPluginApi) {
     publishTown();
     const current = roles.get(threadId)!;
     let note = "";
+    logEvent("complete", `Marked “${current.title}” complete`, threadId, current.bead_id);
     if (current.bead_id) {
       const summary = clip(result ?? current.result ?? "Verified complete by the Mayor.", 500);
       try {
@@ -1214,6 +1354,7 @@ export default async function plugin(bb: BbPluginApi) {
       );
       reloadRoles();
       publishTown();
+      logEvent("unarchived", `${row.role} “${row.title}” came back from the archive`, row.thread_id);
       return;
     }
     const observed = kind === "idle" ? "idle" : kind === "failed" ? "failed" : kind === "archived" ? "archived" : "deleted";
@@ -1224,6 +1365,7 @@ export default async function plugin(bb: BbPluginApi) {
     reloadRoles();
     publishTown();
     const current = roles.get(row.thread_id)!;
+    logEvent(kind, `${current.role} “${current.title}” is ${observed}`, row.thread_id, current.bead_id);
     await alertMayor(current, `${kind}:${row.active_cycle}`, [
       `${current.role} “${current.title}” (${current.thread_id}) is ${observed}.`,
       ...(detail ? [`Detail: ${detail}`] : []),
@@ -1262,6 +1404,7 @@ export default async function plugin(bb: BbPluginApi) {
             if (sent) {
               db.prepare(`UPDATE town_threads SET stall_alerted_cycle=?, updated_at=? WHERE thread_id=?`).run(row.active_cycle, Date.now(), row.thread_id);
               reloadRoles();
+              logEvent("stall", `“${row.title}” active for over ${Math.round(threshold / 60_000)} minutes`, row.thread_id, row.bead_id);
             }
           }
           // Keep claimed beads' leases alive while their polecats run; a
@@ -1273,6 +1416,7 @@ export default async function plugin(bb: BbPluginApi) {
               await runBd(["heartbeat", row.bead_id]);
             } catch (error) {
               bb.log.warn(`Heartbeat failed for bead ${row.bead_id}: ${String(error)}`);
+              logEvent("lease", `Claim lease lost for bead ${row.bead_id} (“${row.title}”)`, row.thread_id, row.bead_id);
               await alertMayor(row, `lease:${row.active_cycle}`, [
                 `The claim lease for bead ${row.bead_id} (“${row.title}”) could not be refreshed.`,
                 "The bead may have been reclaimed or closed while its polecat still runs. Inspect and decide: nudge, re-sling, or complete.",
@@ -1419,6 +1563,7 @@ export default async function plugin(bb: BbPluginApi) {
         beadIds.push((await runBd(args)).trim());
       }
       invalidateLedger();
+      logEvent("convoy", `Convoy created: ${params.goal} (${epicId}, ${beadIds.length} beads)`, null, epicId);
       publishTown();
       return [
         `Convoy created: ${params.goal} (${epicId}).`,
@@ -1509,6 +1654,10 @@ export default async function plugin(bb: BbPluginApi) {
     chooseTown: ({ projectId }) => chooseTown(projectId),
     createTown: (input) => createTown(input),
     ledgerInit: () => initLedger(),
+    townHall: async () => {
+      const [status, board] = await Promise.all([buildStatus(), ledgerBoard()]);
+      return { status, convoys: board.convoys, looseBeads: board.looseBeads, events: recentEvents() };
+    },
     browseTownDirectories: async ({ path }) => {
       const hostId = await defaultHostId();
       const listing = await bb.sdk.hosts.directory({ hostId, ...(path ? { path } : {}) });

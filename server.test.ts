@@ -22,6 +22,25 @@ const bdAvailable = await execFileAsync("bd", ["--version"])
   .then(() => true)
   .catch(() => false);
 
+type TownHallShape = {
+  status: { townProjectId: string | null };
+  convoys: {
+    id: string;
+    title: string;
+    status: string;
+    beads: {
+      id: string;
+      title: string;
+      status: string;
+      ready: boolean;
+      threadId: string | null;
+      threadState: string | null;
+    }[];
+  }[];
+  looseBeads: { id: string }[];
+  events: { at: number; kind: string; message: string }[];
+};
+
 interface Host {
   // eslint-disable-next-line @typescript-eslint/no-explicit-any
   host: any;
@@ -568,6 +587,46 @@ describe.skipIf(!bdAvailable)("madmax ledger (real bd)", () => {
     expect(polecat?.beadId).toBe(bead.id);
     expect(status.ledger?.initialized).toBe(true);
     expect(status.ledger?.inProgress).toBe(1);
+  });
+
+  it("townHall shows the board with linked threads and a newest-first feed", async () => {
+    const { host, dir, mayorId } = await makeLedgerHost();
+    await host.harness.behavior.callAgentTool(
+      "town_convoy",
+      {
+        goal: "Ship auth",
+        beads: [
+          { title: "Add login endpoint", description: "D1: build it." },
+          { title: "Wire sessions", description: "D2: wire it.", dependsOn: [0] },
+        ],
+      },
+      { threadId: mayorId },
+    );
+    const first = (await bdList(dir)).find((issue) => issue.title === "Add login endpoint")!;
+    await host.harness.behavior.callAgentTool("town_sling", { beadId: first.id }, { threadId: mayorId });
+
+    const hall = (await host.harness.behavior.callRpc("townHall", null)) as TownHallShape;
+    expect(hall.convoys).toHaveLength(1);
+    expect(hall.convoys[0]!.title).toBe("Ship auth");
+    const beads = hall.convoys[0]!.beads;
+    expect(beads.map((bead) => bead.title)).toEqual(["Add login endpoint", "Wire sessions"]);
+    // Bead 1 is claimed by a running polecat; bead 2 is blocked by it.
+    expect(beads[0]!.threadId).not.toBeNull();
+    expect(beads[0]!.threadState).toBe("starting");
+    expect(beads[0]!.ready).toBe(false);
+    expect(beads[1]!.ready).toBe(false);
+    expect(beads[1]!.threadId).toBeNull();
+
+    // The feed is newest-first and carries the whole story so far.
+    const kinds = hall.events.map((event) => event.kind);
+    expect(kinds).toContain("mayor");
+    expect(kinds).toContain("convoy");
+    expect(kinds).toContain("sling");
+    expect(kinds.indexOf("sling")).toBeLessThan(kinds.indexOf("convoy"));
+    expect(kinds.indexOf("convoy")).toBeLessThan(kinds.indexOf("mayor"));
+
+    // Loose beads section is empty when everything is parented.
+    expect(hall.looseBeads).toHaveLength(0);
   });
 
   it("reports land on the bead; completion closes it", async () => {

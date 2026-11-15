@@ -50,13 +50,16 @@ the alert outbox.
 
 ## Status
 
-Phase 2 — the Beads ledger layer. Work items are beads in the town's `bd`
-ledger: convoys are epics (`town_convoy`), rig names are labels that route
-slings, beads are claimed at sling time and closed at verified completion,
-and every polecat report lands on its bead as a comment — the ledger is the
-single durable record (NDI). The Deacon heartbeats active claims so long
-runs keep them, and a lost lease alerts the Mayor. New towns are bootstrapped
-with `git init` + `bd init`.
+Phase 3 — the Town Hall. A **Town Hall** page in bb's sidebar shows the town
+problems-first: blocked/failed threads under "Needs attention", the convoy
+board (epics with their beads, ready/blocked/running states, linked polecat
+threads), the live roster, and a newest-first activity feed covering every
+sling, report, nudge, completion, stall, and rig change — all updated live.
+Phase 2 gave the town its Beads ledger: convoys are epics (`town_convoy`),
+rig labels route slings, beads are claimed at sling time and closed at
+verified completion, every polecat report lands on its bead as a comment,
+the Deacon heartbeats active claims, and new towns bootstrap with
+`git init` + `bd init`.
 
 Quick start — the town asks where it should live the first time you start it.
 On bb's New Thread screen, the Madmax section offers importing an existing
@@ -78,7 +81,7 @@ Roadmap:
 
 - [x] Phase 1 — core: roles, section, spawn/sling across rigs, outbox, supervisor
 - [x] Phase 2 — Beads layer: `bd` shell-out, convoys, bead↔thread linkage
-- [ ] Phase 3 — Town Hall UI: problems view, convoy board, roster, feed
+- [x] Phase 3 — Town Hall UI: problems view, convoy board, roster, feed
 - [ ] Phase 4 — refinery: verify, deliver, reviewer threads, landing flow
 
 ## Develop
