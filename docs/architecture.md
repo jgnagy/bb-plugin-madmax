@@ -67,10 +67,25 @@ refiling, state repair — never treat an SDK error as deletion), stall
 detection (`active_since` > `stallMinutes`), claim-lease heartbeats, outbox
 retries, mayor revival.
 
-## Open items
+## Resolved items (was: open)
 
-- Phase 2: resolve the town checkout path from `townProject` for `bd -C`
-  calls; confirm `projects.get` exposes it (else derive from environment).
-- Tier settings shape: five tiers × provider/model/reasoning, as plugin
-  settings.
-- Polecat `permissionMode` default (`accept-edits` vs `auto`) — owner call.
+- Town checkout path for `bd -C`: resolved via `projects.get().sources[]`
+  (`{ path, hostId, isDefault }`); the ledger requires the town source on the
+  bb server's machine.
+- Tier settings: five tiers × provider/model/reasoning as plugin settings,
+  `difficult` by default; Mayor and Reviewer have their own settings.
+- Polecat `permissionMode`: settled with the owner — `accept-edits` default;
+  anything outside a worktree flows polecat → Mayor → owner.
+- bd `review` status: not built-in (open, in_progress, blocked, deferred,
+  closed, pinned, hooked) — town ledger init registers it via
+  `bd config set status.custom review`.
+
+## Remaining known limits
+
+- Reviewer read-only-ness is prompt-level (bb has no read-only permission
+  mode); repairs require the Mayor's explicit `authorizeEdits` nudge.
+- Verify/land shell out to `git` in the worktree path, so the worktree must
+  live on the bb server's machine (single-host towns today).
+- `hosts.pickFolder` (native OS folder dialog) needs a `clientHostId` the
+  plugin app has no documented way to learn, so onboarding uses the in-app
+  `hosts.directory` browser instead.
