@@ -50,31 +50,34 @@ the alert outbox.
 
 ## Status
 
-Phase 1 — the town core, installed and running. One Mayor thread in the town
-project slings work items to polecat threads across registered rigs (five
-model tiers, managed worktrees, `accept-edits` by default), polecats report
-ready/blocked through `polecat_report`, a deterministic Deacon supervisor
-patrols thread lifecycle with a durable alert outbox, and the New Thread
-screen gets a Start Mayor launcher with a live town summary.
+Phase 2 — the Beads ledger layer. Work items are beads in the town's `bd`
+ledger: convoys are epics (`town_convoy`), rig names are labels that route
+slings, beads are claimed at sling time and closed at verified completion,
+and every polecat report lands on its bead as a comment — the ledger is the
+single durable record (NDI). The Deacon heartbeats active claims so long
+runs keep them, and a lost lease alerts the Mayor. New towns are bootstrapped
+with `git init` + `bd init`.
 
 Quick start — the town asks where it should live the first time you start it.
-On bb's New Thread screen, the Madmax section offers your existing projects
-and a "new folder" option; or from the CLI:
+On bb's New Thread screen, the Madmax section offers importing an existing
+project or creating a dedicated folder (recommended); or from the CLI:
 
 ```
-bb madmax init --project <proj-id>        # an existing bb project becomes the town
-bb madmax init --path <dir> --name <name>  # register a fresh folder as the town
+bb madmax init --project <proj-id>        # import an existing town project
+bb madmax init --path <dir> --name <name>  # create a dedicated town folder
 bb madmax rig add <proj-id>               # register a rig
+bb madmax ledger status                   # ledger health and bead counts
 ```
 
 (`bb madmax start` with no town configured prints the same choices; the town
 project can also be set directly with `bb plugin config madmax set
-townProject <proj-id>`, and moving an established town requires that command.)
+townProject <proj-id>`, and moving an established town requires that command.
+`bd` 1.0+ must be on the bb server machine's PATH for the ledger.)
 
 Roadmap:
 
 - [x] Phase 1 — core: roles, section, spawn/sling across rigs, outbox, supervisor
-- [ ] Phase 2 — Beads layer: `bd` shell-out, convoys, bead↔thread linkage
+- [x] Phase 2 — Beads layer: `bd` shell-out, convoys, bead↔thread linkage
 - [ ] Phase 3 — Town Hall UI: problems view, convoy board, roster, feed
 - [ ] Phase 4 — refinery: verify, deliver, reviewer threads, landing flow
 

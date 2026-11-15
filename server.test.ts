@@ -3,15 +3,24 @@
 // The fake host runs the real server.ts with a process-local SQLite store and
 // a recordable bb.sdk: every spawn, section, project, and send call below is a
 // stub whose arguments the assertions inspect. No BB server is needed.
-import { homedir } from "node:os";
-import { resolve } from "node:path";
+import { execFile } from "node:child_process";
+import { mkdtemp } from "node:fs/promises";
+import { existsSync } from "node:fs";
+import { homedir, tmpdir } from "node:os";
+import { join, resolve } from "node:path";
+import { promisify } from "node:util";
 import { afterEach, describe, expect, it } from "vitest";
 import {
   createFakePluginHost,
   makePluginAgentConfigurationContext,
   makeThreadResponse,
 } from "@get-bb/plugin-sdk/testing";
-import plugin from "./server";
+import plugin, { type Bead } from "./server";
+
+const execFileAsync = promisify(execFile);
+const bdAvailable = await execFileAsync("bd", ["--version"])
+  .then(() => true)
+  .catch(() => false);
 
 interface Host {
   // eslint-disable-next-line @typescript-eslint/no-explicit-any
@@ -415,5 +424,229 @@ describe("madmax town backend", () => {
       path: resolve(homedir(), "towns/kept"),
       recursive: true,
     });
+  });
+});
+
+describe.skipIf(!bdAvailable)("madmax ledger (real bd)", () => {
+  const hosts: ReturnType<typeof createFakePluginHost>[] = [];
+
+  afterEach(async () => {
+    for (const host of hosts.splice(0)) await host.harness.lifecycle.dispose();
+  });
+
+  async function bdList(dir: string): Promise<Bead[]> {
+    const { stdout } = await execFileAsync("bd", ["-C", dir, "list", "--all", "--json"], {
+      timeout: 60_000,
+      maxBuffer: 16 * 1024 * 1024,
+    });
+    const parsed = JSON.parse(stdout) as Bead[];
+    return Array.isArray(parsed) ? parsed : (parsed as unknown as { issues: Bead[] }).issues;
+  }
+
+  type ShownBead = Bead & {
+    dependencies?: { id?: string; dependency_type?: string }[];
+  };
+
+  async function bdShow(dir: string, id: string): Promise<ShownBead> {
+    const { stdout } = await execFileAsync("bd", ["-C", dir, "show", id, "--json"], {
+      timeout: 60_000,
+      maxBuffer: 16 * 1024 * 1024,
+    });
+    return (JSON.parse(stdout) as ShownBead[])[0]!;
+  }
+
+  /** A fake host whose town project sources a real, bd-initialized temp dir. */
+  async function makeLedgerHost() {
+    const host = createFakePluginHost({ pluginId: "madmax", agentSkillIds: ["mayor", "polecat"] });
+    hosts.push(host);
+    await plugin(host.bb);
+    const dir = await mkdtemp(join(tmpdir(), "madmax-ledger-"));
+    await execFileAsync("bd", ["init"], { cwd: dir, timeout: 120_000 });
+    host.harness.inspection.sdk.stub("threadSections.list", () => []);
+    host.harness.inspection.sdk.stub("threadSections.create", () => ({ id: "sec_town", name: "Town" }));
+    host.harness.inspection.sdk.stub("projects.get", (args: { projectId: string }) => ({
+      id: args.projectId,
+      name: args.projectId === "proj_rig" ? "authify" : "MyTown",
+      kind: "standard",
+      gitRemoteUrl: null,
+      createdAt: 0,
+      updatedAt: 0,
+      sources: [
+        {
+          id: "src_1", projectId: args.projectId, hostId: "host_1",
+          isDefault: true, path: dir, type: "local_path", createdAt: 0, updatedAt: 0,
+        },
+      ],
+    }));
+    host.harness.inspection.sdk.stub("hosts.list", () => [{ id: "host_1", status: "connected" }]);
+    let counter = 0;
+    host.harness.inspection.sdk.stub("threads.spawn", () =>
+      makeThreadResponse({ id: `thr_ledger_${counter++}`, status: "starting" }));
+    host.harness.inspection.sdk.stub("threads.send", () => ({ ok: true }));
+    host.harness.inspection.sdk.stub("threads.get", (args: { threadId: string }) =>
+      makeThreadResponse({ id: args.threadId, status: "idle" }));
+    await host.harness.behavior.setSettings({ townProject: "proj_town" });
+    const started = (await host.harness.behavior.callRpc("start", { projectId: "proj_town" })) as {
+      threadId: string;
+      created: boolean;
+    };
+    return { host, dir, mayorId: started.threadId };
+  }
+
+  it("town_convoy creates an epic with labeled, ordered beads", async () => {
+    const { host, dir, mayorId } = await makeLedgerHost();
+    const result = await host.harness.behavior.callAgentTool(
+      "town_convoy",
+      {
+        goal: "Ship auth",
+        description: "Auth for the app",
+        rig: "authify",
+        beads: [
+          { title: "Add login endpoint", description: "D1: build the endpoint; done-when tests pass.", priority: 1 },
+          { title: "Wire session middleware", description: "D2: wire sessions; done-when refresh works.", dependsOn: [0] },
+        ],
+      },
+      { threadId: mayorId },
+    );
+    expect(String(result)).toContain("Convoy created");
+
+    const issues = await bdList(dir);
+    const epic = issues.find((issue) => issue.issue_type === "epic");
+    const first = issues.find((issue) => issue.title === "Add login endpoint");
+    const second = issues.find((issue) => issue.title === "Wire session middleware");
+    expect(epic?.title).toBe("Ship auth");
+    expect(first?.parent).toBe(epic?.id);
+    expect(second?.parent).toBe(epic?.id);
+    expect(first?.labels).toContain("authify");
+    expect(second?.labels).toContain("authify");
+
+    // show --json expands dependencies to full issues keyed by id; the
+    // parent-child edge points at the epic, so a match on bead 1's id is
+    // the blocked-by edge town_convoy created.
+    const shown = await bdShow(dir, second!.id);
+    expect(shown.dependencies?.some((dep) => dep.id === first!.id)).toBe(true);
+  });
+
+  it("slinging a bead claims it, routes by rig label, and links the thread", async () => {
+    const { host, dir, mayorId } = await makeLedgerHost();
+    await host.harness.behavior.callRpc("rigAdd", { projectId: "proj_rig" });
+    await host.harness.behavior.callAgentTool(
+      "town_convoy",
+      {
+        goal: "Ship auth",
+        beads: [{ title: "Add login endpoint", description: "D1: build it.", rig: "authify" }],
+      },
+      { threadId: mayorId },
+    );
+    const bead = (await bdList(dir)).find((issue) => issue.title === "Add login endpoint")!;
+
+    const ready = await host.harness.behavior.callAgentTool("town_ready", {}, { threadId: mayorId });
+    expect(String(ready)).toContain("Add login endpoint");
+
+    await host.harness.behavior.callAgentTool(
+      "town_sling",
+      { beadId: bead.id, tier: "small" },
+      { threadId: mayorId },
+    );
+
+    // The authify label routed the polecat into the registered rig project.
+    const spawns = host.harness.inspection.sdk.callsTo("threads.spawn");
+    const polecatSpawn = spawns[spawns.length - 1]![0] as Record<string, unknown>;
+    expect(polecatSpawn.projectId).toBe("proj_rig");
+    expect((polecatSpawn.pluginMetadata as Record<string, unknown>).beadId).toBe(bead.id);
+
+    // The bead is claimed by the town.
+    const shown = await bdShow(dir, bead.id);
+    expect(shown.status).toBe("in_progress");
+    expect((shown as unknown as { assignee?: string }).assignee ?? shown.assignee).toBeTruthy();
+
+    const status = (await host.harness.behavior.callRpc("status", null)) as {
+      threads: { threadId: string; beadId: string | null }[];
+      ledger: { initialized: boolean; inProgress: number } | null;
+    };
+    const polecat = status.threads.find((thread) => thread.role !== "mayor");
+    expect(polecat?.beadId).toBe(bead.id);
+    expect(status.ledger?.initialized).toBe(true);
+    expect(status.ledger?.inProgress).toBe(1);
+  });
+
+  it("reports land on the bead; completion closes it", async () => {
+    const { host, dir, mayorId } = await makeLedgerHost();
+    await host.harness.behavior.callAgentTool(
+      "town_convoy",
+      { goal: "Ship auth", beads: [{ title: "Add login endpoint", description: "D1: build it." }] },
+      { threadId: mayorId },
+    );
+    const bead = (await bdList(dir)).find((issue) => issue.title === "Add login endpoint")!;
+    await host.harness.behavior.callAgentTool("town_sling", { beadId: bead.id }, { threadId: mayorId });
+    expect(host.harness.inspection.sdk.callsTo("threads.spawn")).toHaveLength(2); // mayor + polecat
+    const statusAfter = (await host.harness.behavior.callRpc("status", null)) as {
+      threads: { threadId: string; role: string; beadId: string | null }[];
+    };
+    const polecat = statusAfter.threads.find((thread) => thread.role === "polecat")!;
+    expect(polecat.beadId).toBe(bead.id);
+
+    await host.harness.behavior.callAgentTool(
+      "polecat_report",
+      { state: "ready", result: "Fixed; cart test passes.", recommendation: "Verify and land." },
+      { threadId: polecat.threadId },
+    );
+
+    const afterReport = await bdList(dir);
+    const commented = afterReport.find((issue) => issue.id === bead.id)!;
+    expect(commented.comment_count ?? 0).toBeGreaterThan(0);
+    expect(commented.status).toBe("in_progress"); // reports do not close beads
+
+    const completed = await host.harness.behavior.callAgentTool(
+      "town_complete",
+      { threadId: polecat.threadId, result: "Verified: tests green." },
+      { threadId: mayorId },
+    );
+    expect(String(completed)).toContain("closed in the ledger");
+
+    const afterComplete = await bdList(dir);
+    const closed = afterComplete.find((issue) => issue.id === bead.id)!;
+    expect(closed.status).toBe("closed");
+  });
+
+  it("ledgerInit initializes a bare town checkout", async () => {
+    const host = createFakePluginHost({ pluginId: "madmax", agentSkillIds: ["mayor", "polecat"] });
+    hosts.push(host);
+    await plugin(host.bb);
+    const dir = await mkdtemp(join(tmpdir(), "madmax-bare-"));
+    host.harness.inspection.sdk.stub("projects.get", (args: { projectId: string }) => ({
+      id: args.projectId,
+      name: "MyTown",
+      kind: "standard",
+      gitRemoteUrl: null,
+      createdAt: 0,
+      updatedAt: 0,
+      sources: [
+        {
+          id: "src_1", projectId: args.projectId, hostId: "host_1",
+          isDefault: true, path: dir, type: "local_path", createdAt: 0, updatedAt: 0,
+        },
+      ],
+    }));
+    await host.harness.behavior.setSettings({ townProject: "proj_town" });
+
+    const before = (await host.harness.behavior.callRpc("status", null)) as {
+      ledger: { initialized: boolean } | null;
+    };
+    expect(before.ledger?.initialized).toBe(false);
+
+    const result = (await host.harness.behavior.callRpc("ledgerInit", {})) as {
+      initialized: boolean;
+      path: string;
+    };
+    expect(result.initialized).toBe(true);
+    expect(result.path).toBe(dir);
+    expect(existsSync(join(dir, ".beads"))).toBe(true);
+
+    const after = (await host.harness.behavior.callRpc("status", null)) as {
+      ledger: { initialized: boolean; path: string | null } | null;
+    };
+    expect(after.ledger?.initialized).toBe(true);
+    expect(after.ledger?.path).toBe(dir);
   });
 });

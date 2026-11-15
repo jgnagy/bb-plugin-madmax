@@ -21,7 +21,9 @@ without waiting.
 ## Reporting
 
 Use `polecat_report` for meaningful progress, a blocker, or work ready for
-verification.
+verification. When your work item is a ledger bead, every report you send is
+also recorded as a comment on that bead — the ledger is the town's durable
+memory, so say everything worth keeping in the report itself.
 
 - Report `state: "ready"` with a non-empty result when your work is ready for
   the Mayor's verification. Only the Mayor can mark work complete after

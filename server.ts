@@ -12,9 +12,12 @@
 // spawning, reconciliation that trusts live thread state, and the alert outbox.
 // Conventions adapted from the ghostex "madmax" town skill: GUPP/MEOW/NDI,
 // the brief template, model tiers, escalation, and the never-commit-to-main law.
+import { execFile } from "node:child_process";
 import { randomUUID } from "node:crypto";
+import { existsSync } from "node:fs";
 import { homedir } from "node:os";
-import { resolve } from "node:path";
+import { join, resolve } from "node:path";
+import { promisify } from "node:util";
 import {
   defineRpcContract,
   type BbPluginApi,
@@ -23,6 +26,8 @@ import {
 } from "@get-bb/plugin-sdk";
 import { z } from "zod";
 
+const execFileAsync = promisify(execFile);
+
 const SECTION_NAME = "Town";
 const RULES_FILE = "town.md";
 const RECONCILE_INTERVAL_MS = 30_000;
@@ -30,6 +35,8 @@ const MAX_ALERT_LENGTH = 3_000;
 const MAX_RESULT_LENGTH = 8_000;
 const BUSY_STATUSES = new Set(["active", "starting", "stopping", "pending"]);
 const REALTIME_CHANNEL = "town-changed";
+const BD_TIMEOUT_MS = 60_000;
+const LEDGER_CACHE_MS = 5_000;
 
 const roleSchema = z.enum(["mayor", "polecat", "reviewer"]);
 const stateSchema = z.enum([
@@ -78,13 +85,14 @@ const rigSchema = z.object({
 export type Rig = z.infer<typeof rigSchema>;
 
 const slingParams = z.object({
-  title: z.string().trim().min(1).max(160).describe("Exact concise title for the polecat thread."),
-  mission: z.string().trim().min(1).max(12_000).describe("What to do, why, and what done looks like — self-contained."),
+  title: z.string().trim().min(1).max(160).optional().describe("Exact concise title for the polecat thread. Optional when beadId is given."),
+  mission: z.string().trim().min(1).max(12_000).optional().describe("What to do, why, and what done looks like — self-contained. Optional when beadId is given."),
   successCriteria: z.array(z.string().trim().min(1).max(1_000)).max(30).optional(),
   constraints: z.array(z.string().trim().min(1).max(1_000)).max(30).optional(),
   context: z.string().trim().max(12_000).optional(),
   tier: tierSchema.optional().describe("Model tier for this work item; defaults to 'difficult'."),
-  rigProjectId: z.string().trim().min(1).optional().describe("Registered rig project to work in; defaults to the town project (town work)."),
+  rigProjectId: z.string().trim().min(1).optional().describe("Registered rig project to work in; defaults to the bead's rig label, else the town project."),
+  beadId: z.string().trim().min(1).optional().describe("Bead to sling from the town ledger; its title and description become the brief."),
 });
 
 const optionalReport = z.object({
@@ -107,6 +115,40 @@ const blockedReport = z.object({
 });
 const reportParams = z.discriminatedUnion("state", [optionalReport, readyReport, blockedReport]);
 
+/** A bd issue as returned by `bd list/show --json` (fields we rely on). */
+const beadSchema = z.object({
+  id: z.string(),
+  title: z.string(),
+  description: z.string().nullable().optional(),
+  status: z.string(),
+  priority: z.union([z.number(), z.string()]).nullable().optional(),
+  issue_type: z.string().nullable().optional(),
+  labels: z.array(z.string()).nullable().optional(),
+  parent: z.string().nullable().optional(),
+  comment_count: z.number().nullable().optional(),
+});
+export type Bead = z.infer<typeof beadSchema>;
+
+const convoyBeadParams = z.object({
+  title: z.string().trim().min(1).max(200).describe("Short, literal bead title."),
+  description: z.string().trim().min(1).max(8_000).describe("What + why + done-when — self-contained; a fresh polecat reads only this and the brief."),
+  priority: z.number().int().min(0).max(4).optional().describe("0 is highest; default 2."),
+  rig: z.string().trim().min(1).optional().describe("Rig label for routing the sling later; defaults to the convoy's rig."),
+  dependsOn: z.array(z.number().int().min(0)).max(20).optional().describe("Indices of earlier beads in this convoy that must land first."),
+});
+
+const convoyParams = z.object({
+  goal: z.string().trim().min(1).max(200).describe("The convoy's goal — becomes the epic's title."),
+  description: z.string().trim().max(8_000).optional().describe("Why this convoy exists and what done looks like."),
+  rig: z.string().trim().min(1).optional().describe("Rig label applied to every bead in the convoy."),
+  beads: z.array(convoyBeadParams).min(1).max(50),
+});
+
+const completeParams = z.object({
+  threadId: z.string().trim().min(1),
+  result: z.string().trim().max(MAX_RESULT_LENGTH).optional().describe("The verified outcome recorded on the bead."),
+});
+
 export const rpcContract = defineRpcContract({
   status: {
     input: z.null(),
@@ -116,6 +158,17 @@ export const rpcContract = defineRpcContract({
       mayor: managedThreadSchema.nullable(),
       threads: z.array(managedThreadSchema),
       rigs: z.array(rigSchema),
+      ledger: z
+        .object({
+          bdAvailable: z.boolean(),
+          initialized: z.boolean(),
+          path: z.string().nullable(),
+          open: z.number(),
+          inProgress: z.number(),
+          ready: z.number(),
+          convoys: z.number(),
+        })
+        .nullable(),
     }),
   },
   start: {
@@ -161,6 +214,10 @@ export const rpcContract = defineRpcContract({
         directories: z.array(z.object({ name: z.string(), path: z.string() }).strict()),
       })
       .strict(),
+  },
+  ledgerInit: {
+    input: z.object({}).strict(),
+    output: z.object({ initialized: z.boolean(), path: z.string() }).strict(),
   },
 });
 
@@ -520,6 +577,127 @@ export default async function plugin(bb: BbPluginApi) {
       .join("\n");
   }
 
+  // ── The Beads ledger ─────────────────────────────────────────────────
+  // bd is the single source of truth for work items; plugin storage only
+  // maps threads to beads. Every bd call is scoped with -C <town checkout>
+  // so a polecat worktree can never discover the wrong ledger. Plugin bd
+  // operations run as the ambient git identity on purpose: the owner's
+  // manual bd commands must interoperate with the town's (claims, closes,
+  // heartbeats all check the holder's identity).
+
+  let bdAvailable: boolean | null = null;
+  async function isBdAvailable() {
+    if (bdAvailable === null) {
+      bdAvailable = await execFileAsync("bd", ["--version"], { timeout: 10_000 })
+        .then(() => true)
+        .catch(() => false);
+    }
+    return bdAvailable;
+  }
+
+  /** The town checkout path, from the town project's default local source. */
+  async function townLedgerDir(): Promise<string> {
+    const townProjectId = await configuredTownProject();
+    if (!townProjectId) throw new Error(await noTownMessage());
+    const project = await bb.sdk.projects.get({ projectId: townProjectId });
+    const source = project.sources.find((candidate) => candidate.isDefault) ?? project.sources[0];
+    if (!source) {
+      throw new Error("The town project has no local source; the ledger needs a checkout on the bb server's machine.");
+    }
+    return source.path;
+  }
+
+  async function runBd(args: string[]): Promise<string> {
+    const cwd = await townLedgerDir();
+    try {
+      const { stdout } = await execFileAsync("bd", ["-C", cwd, ...args], {
+        timeout: BD_TIMEOUT_MS,
+        maxBuffer: 16 * 1024 * 1024,
+      });
+      return stdout;
+    } catch (error) {
+      const detail = error instanceof Error ? error.message : String(error);
+      throw new Error(`bd ${args[0] ?? ""} failed in ${cwd}: ${clip(detail, 1_000)}`);
+    }
+  }
+
+  async function bdJson<T>(args: string[]): Promise<T> {
+    const stdout = await runBd([...args, "--json"]);
+    const parsed: unknown = JSON.parse(stdout);
+    return (Array.isArray(parsed) ? parsed : (parsed as { issues?: unknown }).issues ?? parsed) as T;
+  }
+
+  async function ensureLedger(): Promise<void> {
+    if (!(await isBdAvailable())) {
+      throw new Error("bd (Beads) was not found on the bb server machine — install it: https://github.com/gastownhall/beads");
+    }
+    if (!existsSync(join(await townLedgerDir(), ".beads"))) {
+      throw new Error("The town ledger is not initialized. Run: bb madmax ledger init");
+    }
+  }
+
+  async function initLedger(): Promise<{ initialized: boolean; path: string }> {
+    const path = await townLedgerDir();
+    if (existsSync(join(path, ".beads"))) return { initialized: true, path };
+    if (!(await isBdAvailable())) {
+      throw new Error("bd (Beads) was not found on the bb server machine — install it: https://github.com/gastownhall/beads");
+    }
+    await execFileAsync("bd", ["init"], { cwd: path, timeout: BD_TIMEOUT_MS, maxBuffer: 16 * 1024 * 1024 });
+    ledgerCache = null;
+    return { initialized: true, path };
+  }
+
+  function invalidateLedger() {
+    ledgerCache = null;
+  }
+
+  type LedgerBlock = {
+    bdAvailable: boolean;
+    initialized: boolean;
+    path: string | null;
+    open: number;
+    inProgress: number;
+    ready: number;
+    convoys: number;
+  };
+
+  let ledgerCache: { at: number; value: LedgerBlock } | null = null;
+  async function ledgerBlock(): Promise<LedgerBlock | null> {
+    if (!(await configuredTownProject())) return null;
+    if (ledgerCache && Date.now() - ledgerCache.at < LEDGER_CACHE_MS) return ledgerCache.value;
+    const value: LedgerBlock = {
+      bdAvailable: await isBdAvailable(),
+      initialized: false,
+      path: null,
+      open: 0,
+      inProgress: 0,
+      ready: 0,
+      convoys: 0,
+    };
+    if (value.bdAvailable) {
+      try {
+        const path = await townLedgerDir();
+        value.path = path;
+        if (existsSync(join(path, ".beads"))) {
+          const [issues, readyIssues] = await Promise.all([
+            bdJson<Bead[]>(["list", "--all"]),
+            bdJson<Bead[]>(["ready"]),
+          ]);
+          value.initialized = true;
+          value.open = issues.filter((issue) => issue.status === "open" && issue.issue_type !== "epic").length;
+          value.inProgress = issues.filter((issue) => issue.status === "in_progress").length;
+          value.ready = readyIssues.filter((issue) => issue.issue_type !== "epic").length;
+          value.convoys = issues.filter((issue) => issue.issue_type === "epic" && issue.status !== "closed").length;
+        }
+      } catch {
+        // A town without a resolvable checkout stays quiet here; operations
+        // that need the ledger report their own errors.
+      }
+    }
+    ledgerCache = { at: Date.now(), value };
+    return value;
+  }
+
   async function spawnMayor(target: string, previous?: ManagedRow) {
     const values = await settings.get();
     const sectionId = await ensureSection();
@@ -625,6 +803,24 @@ export default async function plugin(bb: BbPluginApi) {
         contentEncoding: "utf8",
       });
     }
+    // A town wants version control and a ledger. Both are best-effort:
+    // a town without git or bd still works for brief-only slings, and the
+    // UI surfaces what is missing.
+    try {
+      if (!existsSync(join(path, ".git"))) {
+        await execFileAsync("git", ["init"], { cwd: path, timeout: 30_000 });
+      }
+    } catch (error) {
+      bb.log.warn(`git init skipped for the new town: ${String(error)}`);
+    }
+    try {
+      if (!existsSync(join(path, ".beads")) && (await isBdAvailable())) {
+        await execFileAsync("bd", ["init"], { cwd: path, timeout: BD_TIMEOUT_MS, maxBuffer: 16 * 1024 * 1024 });
+        invalidateLedger();
+      }
+    } catch (error) {
+      bb.log.warn(`bd init skipped for the new town: ${String(error)}`);
+    }
     const project = await bb.sdk.projects.create({
       name: input.name,
       source: { type: "local_path", hostId, path },
@@ -654,6 +850,14 @@ export default async function plugin(bb: BbPluginApi) {
     return result.changes > 0;
   }
 
+  function rigProjectForLabel(label: string | undefined): string | null {
+    if (!label) return null;
+    const row = (allRigs.all() as RigRow[]).find(
+      (candidate) => candidate.name === label || candidate.project_id === label,
+    );
+    return row?.project_id ?? null;
+  }
+
   async function sling(params: z.infer<typeof slingParams>, callerThreadId?: string | null) {
     const caller = callerThreadId ? roles.get(callerThreadId) : undefined;
     const values = await settings.get();
@@ -664,9 +868,31 @@ export default async function plugin(bb: BbPluginApi) {
     }
     const townId = mayor.project_id || townProject;
     if (!townId) throw new Error("No town project is configured.");
-    const rigProjectId = params.rigProjectId ?? townId;
+
+    // A bead carries its own brief; otherwise the caller must supply one.
+    let bead: Bead | null = null;
+    if (params.beadId) {
+      await ensureLedger();
+      const found = await bdJson<Bead[]>(["show", params.beadId]);
+      bead = found[0] ?? null;
+      if (!bead) throw new Error(`No bead ${params.beadId} in the town ledger.`);
+      if (bead.status === "closed") throw new Error(`Bead ${params.beadId} is closed; reopen it before slinging.`);
+    } else if (!params.title || !params.mission) {
+      throw new Error("Sling needs either a beadId from the ledger, or both a title and a mission.");
+    }
+    const title = clip(params.title ?? bead!.title, 160);
+    const mission = params.mission ?? bead!.description ?? bead!.title;
+
+    const rigProjectId =
+      params.rigProjectId ??
+      (bead ? (bead.labels ?? []).map((label) => rigProjectForLabel(label)).find((id): id is string => id !== null) : undefined) ??
+      townId;
     if (rigProjectId !== townId && !isRig(rigProjectId)) {
       throw new Error(`Project ${rigProjectId} is not a registered rig. Register it first: bb madmax rig add ${rigProjectId}`);
+    }
+    if (bead) {
+      await runBd(["update", bead.id, "--claim"]);
+      invalidateLedger();
     }
     const tier: Tier = params.tier ?? DEFAULT_TIER;
     const sectionId = await ensureSection();
@@ -676,8 +902,9 @@ export default async function plugin(bb: BbPluginApi) {
     const brief = [
       `You are a polecat in the town of ${townName}, working on rig ${rigName}.`,
       "",
-      `## Work item`, params.title,
-      "", "## Goal", params.mission,
+      `## Work item`,
+      bead ? `${title} (bead ${bead.id} in the town ledger)` : title,
+      "", "## Goal", mission,
       "", "## Success criteria", bullets(params.successCriteria),
       "", "## Constraints", bullets(params.constraints),
       ...(params.context ? ["", "## Context", params.context] : []),
@@ -709,16 +936,16 @@ export default async function plugin(bb: BbPluginApi) {
       parentThreadId: mayor.thread_id,
       lifecycleOwnerThreadId: mayor.thread_id,
       parentNotifications: "stuck",
-      pluginMetadata: { role: "polecat", tier, rig: rigProjectId, town: townId, beadId: null },
+      pluginMetadata: { role: "polecat", tier, rig: rigProjectId, town: townId, beadId: bead?.id ?? null },
       ...tierExecution(values, tier),
       prompt: brief,
     });
     insertThread({
       threadId: thread.id, role: "polecat", projectId: rigProjectId,
-      mayorThreadId: mayor.thread_id, tier, title: params.title,
+      mayorThreadId: mayor.thread_id, beadId: bead?.id ?? null, tier, title,
       state: "starting", status: thread.status,
     });
-    return { threadId: thread.id, title: params.title, projectId: rigProjectId, tier };
+    return { threadId: thread.id, title, projectId: rigProjectId, tier, beadId: bead?.id ?? null };
   }
 
   async function nudge(threadId: string, text: string, steer = false) {
@@ -815,6 +1042,15 @@ export default async function plugin(bb: BbPluginApi) {
     if (!delivered) {
       throw new Error("Report was saved but could not be delivered to the Mayor. It will retry automatically; check Mayor connectivity before reporting again.");
     }
+    // NDI: the ledger is the durable record — reports land on the bead.
+    if (current.bead_id) {
+      try {
+        await runBd(["comment", current.bead_id, clip(summary, 4_000)]);
+        invalidateLedger();
+      } catch (error) {
+        bb.log.warn(`Could not record the report on bead ${current.bead_id}: ${String(error)}`);
+      }
+    }
     return current;
   }
 
@@ -846,6 +1082,37 @@ export default async function plugin(bb: BbPluginApi) {
       ...(row.recommendation ? [`Recommendation: ${clip(row.recommendation, 1_000)}`] : []),
       `Last assistant output:\n${output ? clip(output, 4_000) : "(none available)"}`,
     ].join("\n");
+  }
+
+  /** Mayor-verified completion; closes the linked bead in the ledger. */
+  async function complete(threadId: string, result?: string) {
+    const row = roles.get(threadId);
+    if (!row || row.role === "mayor") throw new Error(`No managed polecat or reviewer ${threadId}.`);
+    const live = await bb.sdk.threads.get({ threadId });
+    if (BUSY_STATUSES.has(live.status)) throw new Error(`Cannot complete ${threadId} while it is ${live.status}.`);
+    if (live.deletedAt !== null || live.archivedAt !== null) throw new Error(`Cannot complete ${threadId} because it is not a live thread.`);
+    const now = Date.now();
+    db.prepare(`UPDATE town_threads SET state='complete', status=?, result=COALESCE(?, result),
+      blocker=NULL, recommendation=NULL, active_since=NULL, updated_at=? WHERE thread_id=?`).run(
+      live.status, result ? clip(result, MAX_RESULT_LENGTH) : null, now, threadId,
+    );
+    reloadRoles();
+    publishTown();
+    const current = roles.get(threadId)!;
+    let note = "";
+    if (current.bead_id) {
+      const summary = clip(result ?? current.result ?? "Verified complete by the Mayor.", 500);
+      try {
+        await runBd(["comment", current.bead_id, `Completed by the town: ${result ?? "verified by the Mayor."}`]);
+        await runBd(["close", current.bead_id, "--reason", summary]);
+        invalidateLedger();
+        note = ` Bead ${current.bead_id} closed in the ledger.`;
+      } catch (error) {
+        note = ` WARNING: the thread is complete but bead ${current.bead_id} could not be closed: ${clip(String(error), 300)}`;
+        bb.log.warn(note);
+      }
+    }
+    return { threadId, title: current.title, beadId: current.bead_id, note };
   }
 
   function stateFromLive(row: ManagedRow, status: string) {
@@ -997,6 +1264,21 @@ export default async function plugin(bb: BbPluginApi) {
               reloadRoles();
             }
           }
+          // Keep claimed beads' leases alive while their polecats run; a
+          // lost lease means the bead was reclaimed or closed out from
+          // under a running thread, and the Mayor should decide.
+          for (const row of [...roles.values()]) {
+            if (row.role === "mayor" || row.state !== "active" || row.active_since === null || !row.bead_id) continue;
+            try {
+              await runBd(["heartbeat", row.bead_id]);
+            } catch (error) {
+              bb.log.warn(`Heartbeat failed for bead ${row.bead_id}: ${String(error)}`);
+              await alertMayor(row, `lease:${row.active_cycle}`, [
+                `The claim lease for bead ${row.bead_id} (“${row.title}”) could not be refreshed.`,
+                "The bead may have been reclaimed or closed while its polecat still runs. Inspect and decide: nudge, re-sling, or complete.",
+              ].join("\n")).catch(() => false);
+            }
+          }
           const mayorTerminal =
             [...roles.values()].some((row) => row.role === "mayor" && ["failed", "archived", "deleted"].includes(row.state));
           if (mayorTerminal && ((await settings.get()).townProject as string | null)) {
@@ -1025,6 +1307,18 @@ export default async function plugin(bb: BbPluginApi) {
     return [...roles.values()].filter(
       (row) => belongsToMayor(row, mayorThreadId) && row.role !== "mayor" && (includeComplete || row.state !== "complete"),
     );
+  }
+
+  async function buildStatus() {
+    const mayor = mayorRow();
+    return {
+      sectionId: storedSectionId(),
+      townProjectId: await configuredTownProject(),
+      mayor: mayor ? toManaged(mayor) : null,
+      threads: [...roles.values()].map(toManaged),
+      rigs: (allRigs.all() as RigRow[]).map((row) => ({ projectId: row.project_id, name: row.name, registeredAt: row.registered_at })),
+      ledger: await ledgerBlock(),
+    };
   }
 
   bb.agents.registerTool({
@@ -1088,6 +1382,85 @@ export default async function plugin(bb: BbPluginApi) {
     },
   });
   bb.agents.registerTool({
+    name: "town_convoy",
+    description: "Create a convoy (epic) with self-contained beads in the town ledger, ready for slinging.",
+    parameters: convoyParams,
+    async execute(params, context) {
+      const caller = context.threadId ? roles.get(context.threadId) : undefined;
+      if (!caller || caller.role !== "mayor" || ["complete", "archived", "deleted"].includes(caller.state)) {
+        throw new Error("town_convoy requires an active registered Mayor thread.");
+      }
+      await ensureLedger();
+      const epicArgs = ["create", params.goal, "--type=epic", "-p", "1", "--silent"];
+      if (params.description) epicArgs.push("-d", params.description);
+      const epicId = (await runBd(epicArgs)).trim();
+      const beadIds: string[] = [];
+      for (const [index, bead] of params.beads.entries()) {
+        const args = [
+          "create", bead.title, "--parent", epicId,
+          "-p", String(bead.priority ?? 2),
+          "-d", bead.description,
+          "--silent",
+        ];
+        const label = bead.rig ?? params.rig;
+        if (label) args.push("-l", label);
+        if (bead.dependsOn?.length) {
+          const deps = bead.dependsOn.map((depIndex) => {
+            const target = beadIds[depIndex];
+            if (!target) {
+              throw new Error(
+                `Bead ${index} depends on bead ${depIndex}, which does not exist yet; dependsOn must reference earlier beads.`,
+              );
+            }
+            return `blocked-by:${target}`;
+          });
+          args.push("--deps", deps.join(","));
+        }
+        beadIds.push((await runBd(args)).trim());
+      }
+      invalidateLedger();
+      publishTown();
+      return [
+        `Convoy created: ${params.goal} (${epicId}).`,
+        ...beadIds.map((id, index) => {
+          const bead = params.beads[index]!;
+          return `${id}  ${bead.title}${bead.dependsOn?.length ? " (blocked)" : ""}${bead.rig ?? params.rig ? ` [${bead.rig ?? params.rig}]` : ""}`;
+        }),
+        "Sling each with town_sling (beadId + an honest tier); find claimable work any time with town_ready.",
+      ].join("\n");
+    },
+  });
+  bb.agents.registerTool({
+    name: "town_ready",
+    description: "List ready beads (open, unblocked, not epics) from the town ledger with their labels.",
+    parameters: z.object({}).strict(),
+    async execute(_params, context) {
+      const caller = context.threadId ? roles.get(context.threadId) : undefined;
+      if (!caller || caller.role !== "mayor") throw new Error("town_ready requires a registered Mayor thread.");
+      await ensureLedger();
+      const ready = (await bdJson<Bead[]>(["ready"])).filter((bead) => bead.issue_type !== "epic");
+      return ready.length
+        ? ready
+            .map((bead) => `${bead.id}  ${bead.title}${bead.labels?.length ? ` [${bead.labels.join(", ")}]` : ""} (p${bead.priority ?? "?"})`)
+            .join("\n")
+        : "No ready beads in the town ledger.";
+    },
+  });
+  bb.agents.registerTool({
+    name: "town_complete",
+    description: "Mark a managed thread complete after verifying its evidence; closes the linked bead in the ledger.",
+    parameters: completeParams,
+    async execute(params, context) {
+      const caller = context.threadId ? roles.get(context.threadId) : undefined;
+      const target = roles.get(params.threadId);
+      if (!caller || caller.role !== "mayor" || !target || !belongsToMayor(target, caller.thread_id)) {
+        throw new Error(`No managed thread ${params.threadId} for this Mayor.`);
+      }
+      const row = await complete(params.threadId, params.result);
+      return `Marked “${row.title}” complete.${row.note}`;
+    },
+  });
+  bb.agents.registerTool({
     name: "polecat_report",
     description: "Report managed work state and evidence to the Mayor. Use ready, not complete; blocked requires blocker and recommendation.",
     parameters: reportParams,
@@ -1109,9 +1482,9 @@ export default async function plugin(bb: BbPluginApi) {
     const rules = row ? (rulesCache.get(row.project_id) ?? BUILT_IN_RULES) : BUILT_IN_RULES;
     if (role === "mayor") {
       return {
-        tools: ["town_sling", "town_roster", "town_inspect", "town_nudge"],
+        tools: ["town_sling", "town_roster", "town_inspect", "town_nudge", "town_convoy", "town_ready", "town_complete"],
         skills: ["mayor"],
-        instructions: `You are the registered Mayor supervising the town's polecat threads from ${context.project.name}.\n\n${rules}`,
+        instructions: `You are the registered Mayor supervising the town's polecat threads from ${context.project.name}. Decompose goals into convoys (town_convoy), sling beads to polecats (town_sling), and drive work through verified completion (town_complete).\n\n${rules}`,
       };
     }
     return {
@@ -1122,16 +1495,7 @@ export default async function plugin(bb: BbPluginApi) {
   });
 
   bb.rpc.register(rpcContract, {
-    status: async () => {
-      const mayor = mayorRow();
-      return {
-        sectionId: storedSectionId(),
-        townProjectId: await configuredTownProject(),
-        mayor: mayor ? toManaged(mayor) : null,
-        threads: [...roles.values()].map(toManaged),
-        rigs: (allRigs.all() as RigRow[]).map((row) => ({ projectId: row.project_id, name: row.name, registeredAt: row.registered_at })),
-      };
-    },
+    status: () => buildStatus(),
     start: ({ projectId }) => ensureMayor(projectId ?? undefined),
     rigAdd: ({ projectId }) => addRig(projectId),
     rigRemove: ({ projectId }) => ({ removed: removeRig(projectId) }),
@@ -1144,6 +1508,7 @@ export default async function plugin(bb: BbPluginApi) {
     }),
     chooseTown: ({ projectId }) => chooseTown(projectId),
     createTown: (input) => createTown(input),
+    ledgerInit: () => initLedger(),
     browseTownDirectories: async ({ path }) => {
       const hostId = await defaultHostId();
       const listing = await bb.sdk.hosts.directory({ hostId, ...(path ? { path } : {}) });
@@ -1167,9 +1532,12 @@ export default async function plugin(bb: BbPluginApi) {
     "  bb madmax start [--project <proj-id>] [--json]",
     "  bb madmax init --project <proj-id>",
     "  bb madmax init --path <dir> --name <name> [--host <host-id>]",
+    "  bb madmax ledger init",
+    "  bb madmax ledger status [--json]",
     "  bb madmax rig list [--json]",
     "  bb madmax rig add <project-id>",
     "  bb madmax rig remove <project-id>",
+    "  bb madmax sling --bead <bead-id> [--rig <project-id>] [--tier <tier>] [--json]",
     "  bb madmax sling --title \"…\" --mission \"…\" [--criteria \"…\"]... [--constraint \"…\"]... [--context \"…\"] [--rig <project-id>] [--tier <tier>] [--json]",
     "  bb madmax nudge <thread-id> --text \"…\" [--steer] [--json]",
     "  bb madmax inspect <thread-id>",
@@ -1182,6 +1550,7 @@ export default async function plugin(bb: BbPluginApi) {
       { name: "status", summary: "Show the town's roster", usage: "bb madmax status [--json]" },
       { name: "start", summary: "Start or return the town's Mayor", usage: "bb madmax start [--project <proj-id>] [--json]" },
       { name: "init", summary: "Choose the town project (existing or a new folder) and start the Mayor", usage: "bb madmax init --project <proj-id> | --path <dir> --name <name> [--host <host-id>]" },
+      { name: "ledger", summary: "Initialize or inspect the town's Beads ledger", usage: "bb madmax ledger init|status [--json]" },
       { name: "rig", summary: "Manage registered rig projects", usage: "bb madmax rig list|add|remove" },
       { name: "sling", summary: "Sling a work item to a polecat", usage: "bb madmax sling --title \"…\" --mission \"…\" [--rig <project-id>] [--tier <tier>] [--json]" },
       { name: "nudge", summary: "Nudge a managed polecat", usage: "bb madmax nudge <thread-id> --text \"…\" [--steer] [--json]" },
@@ -1196,20 +1565,25 @@ export default async function plugin(bb: BbPluginApi) {
       try {
         if (!command || command === "help" || command === "--help") return ok({}, usage);
         if (command === "status") {
-          const mayor = mayorRow();
-          const townProjectId = await configuredTownProject();
-          const threads = [...roles.values()].map(toManaged);
-          const rigs = (allRigs.all() as RigRow[]).map((row) => ({ projectId: row.project_id, name: row.name, registeredAt: row.registered_at }));
+          const status = await buildStatus();
+          const ledgerLines = status.ledger === null
+            ? []
+            : status.ledger.bdAvailable
+              ? status.ledger.initialized
+                ? [`Ledger: ${status.ledger.path} — ${status.ledger.open} open · ${status.ledger.inProgress} in progress · ${status.ledger.ready} ready · ${status.ledger.convoys} convoys`]
+                : ["Ledger: not initialized — run: bb madmax ledger init"]
+              : ["Ledger: bd not installed on this machine — https://github.com/gastownhall/beads"];
           return ok(
-            { sectionId: storedSectionId(), townProjectId, mayor: mayor ? toManaged(mayor) : null, threads, rigs },
+            status,
             [
-              mayor
-                ? `Mayor: ${mayor.title} (${mayor.state}) ${mayor.thread_id}`
-                : townProjectId
-                  ? `Town: ${townProjectId} — no Mayor yet. Run: bb madmax start`
+              status.mayor
+                ? `Mayor: ${status.mayor.title} (${status.mayor.state}) ${status.mayor.threadId}`
+                : status.townProjectId
+                  ? `Town: ${status.townProjectId} — no Mayor yet. Run: bb madmax start`
                   : "No town yet. Run: bb madmax init",
-              ...threads.filter((row) => row.role !== "mayor").map((row) => `${row.role.padEnd(8)} ${row.state.padEnd(9)} ${row.title}  ${row.threadId}`),
-              ...(rigs.length ? [`Rigs: ${rigs.map((rig) => rig.name).join(", ")}`] : []),
+              ...status.threads.filter((thread) => thread.role !== "mayor").map((thread) => `${thread.role.padEnd(8)} ${thread.state.padEnd(9)} ${thread.title}  ${thread.threadId}`),
+              ...(status.rigs.length ? [`Rigs: ${status.rigs.map((rig) => rig.name).join(", ")}`] : []),
+              ...ledgerLines,
             ].join("\n"),
           );
         }
@@ -1251,16 +1625,46 @@ export default async function plugin(bb: BbPluginApi) {
           }
           return fail(`Unknown rig subcommand “${sub}”.`);
         }
+        if (command === "ledger") {
+          const [sub] = args.positional;
+          if (sub === "init") {
+            const result = await initLedger();
+            return ok(result, `Ledger initialized at ${result.path}.`);
+          }
+          if (sub === "status" || sub === undefined) {
+            const ledger = await ledgerBlock();
+            if (ledger === null) return fail(await noTownMessage());
+            return ok(
+              ledger,
+              [
+                `bd: ${ledger.bdAvailable ? "available" : "NOT installed — https://github.com/gastownhall/beads"}`,
+                `Ledger: ${ledger.initialized ? `initialized at ${ledger.path}` : "not initialized — run: bb madmax ledger init"}`,
+                ...(ledger.initialized
+                  ? [
+                      `Open beads: ${ledger.open}`,
+                      `In progress: ${ledger.inProgress}`,
+                      `Ready: ${ledger.ready}`,
+                      `Convoys: ${ledger.convoys}`,
+                    ]
+                  : []),
+              ].join("\n"),
+            );
+          }
+          return fail(`Unknown ledger subcommand “${sub}”.`);
+        }
         if (command === "sling") {
           const parsed = slingParams.safeParse({
             title: args.one("title"), mission: args.one("mission"),
             successCriteria: args.all("criteria"), constraints: args.all("constraint"), context: args.one("context"),
-            tier: args.one("tier"), rigProjectId: args.one("rig"),
+            tier: args.one("tier"), rigProjectId: args.one("rig"), beadId: args.one("bead"),
           });
           if (!parsed.success) return fail(`Invalid sling brief: ${parsed.error.issues[0]?.message ?? "check the arguments"}`);
           await ensureMayor();
           const result = await sling(parsed.data, context.threadId);
-          return ok(result, `Slung “${result.title}” to a polecat in ${result.threadId} (tier ${result.tier}).`);
+          return ok(
+            result,
+            `Slung “${result.title}” to a polecat in ${result.threadId} (tier ${result.tier}${result.beadId ? `, bead ${result.beadId}` : ""}).`,
+          );
         }
         if (command === "nudge") {
           const threadId = args.positional[0];
