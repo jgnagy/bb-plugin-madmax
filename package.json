@@ -6,11 +6,11 @@
   "author": "jgnagy",
   "repository": {
     "type": "git",
-    "url": "git+https://github.com/jgnagy/madmax.git"
+    "url": "git+https://github.com/jgnagy/bb-plugin-madmax.git"
   },
-  "homepage": "https://github.com/jgnagy/madmax#readme",
+  "homepage": "https://github.com/jgnagy/bb-plugin-madmax#readme",
   "bugs": {
-    "url": "https://github.com/jgnagy/madmax/issues"
+    "url": "https://github.com/jgnagy/bb-plugin-madmax/issues"
   },
   "type": "module",
   "engines": {
