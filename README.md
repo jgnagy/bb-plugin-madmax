@@ -7,131 +7,182 @@ ledger.
 One **Mayor** thread coordinates work across every project you register as a
 **rig**. It breaks goals into beads (convoys are epics), slings each bead to a
 **polecat** worker thread running in its own bb-managed worktree, patrols
-thread health deterministically, verifies finished work (with a read-only
-reviewer), and delivers it — branch pushed, bead to review — while the owner
-decides what merges. Work state lives in Beads, so it survives session loss,
-plugin reloads, and bb itself.
+thread health deterministically, verifies finished work, and delivers it —
+branch pushed, bead to review — while you decide what merges. Work state
+lives in Beads, so it survives session loss, plugin reloads, and bb itself.
 
-## Lineage
+## Features
 
-- [Gas Town](https://github.com/gastownhall/gastown) (MIT, retired) — the
-  concepts: town, mayor, rig, polecat, hook, convoy, bead, refinery, GUPP/MEOW/NDI.
-- [Beads / `bd`](https://github.com/gastownhall/beads) — the durable ledger
-  this plugin is built on. Required on the bb server machine.
-- [Chief for bb](https://github.com/divyesh-puri/bb-plugin-chief) (MIT) — the
-  proven bb plugin patterns: role-gated agent tools, visible worker threads in
-  a sidebar section, managed-worktree spawning, a deterministic supervisor with
-  a durable alert outbox, and reconciliation that trusts live thread state.
-- Earlier Gas Town emulations on other agent harnesses — the operational
-  conventions (brief template, model tiers, verify-and-land ritual, the
-  never-commit-to-main law) this plugin carries forward.
+**One Mayor, many rigs.** The Mayor is an ordinary visible bb thread in the
+town project. Rigs are any bb projects you register — including repos the
+Mayor clones itself when you name one it doesn't know. Polecats are ordinary
+visible threads too: watch them live, read their transcripts, or take over
+mid-turn.
 
-## Architecture
+**A real work ledger.** Convoys are epics, beads are the work items, rig
+names are labels that route slings. Beads are claimed at sling time and
+closed at verified completion, every polecat report lands on its bead as a
+comment, and claim leases are kept alive by the patrol while work runs.
+`bd` is the single source of truth — the plugin never keeps a parallel
+ledger, and your own `bd` commands interoperate with the town's.
 
-| Gas Town concept | madmax mechanism |
+**Conversational rig onboarding.** "I'd like to make a PR for \<github
+repo\> to fix \<issue\>" works end to end: the Mayor clones the repo into
+the town's `rigs/` directory, reads the issue with `gh`, slings a bead
+tagged with the rig, and delivers the branch when the work verifies.
+Opening the PR is owner-approved at dispatch and travels in the polecat's
+brief.
+
+**Adversarial reviews before landing.** Lite mode (one reviewer) or full
+mode (one reviewer per criterion — security, maintainability, performance,
+quality, or your own), each working as a persona you name. Every review
+runs three phases — findings with HIGH/MEDIUM/LOW confidence, verification
+of the HIGH findings, then a ship/fix verdict — and the Mayor drives the
+fix loop until the verdict is clean.
+
+**PR review as a task.** Point the Mayor at someone else's pull request:
+it finds or creates the rig, mints a dedicated bead, and spawns reviewer
+threads that check out the PR. The Mayor compiles the findings and drafts
+the PR response — approve, comment, or request changes — and you decide
+whether to post it.
+
+**Patrol roles on cron or demand.** The **Buzzard** circles a repo for
+pointless tests, obvious comments, dead code, abandoned PRs, and unused
+dependencies (optionally unmaintained ones), reporting to the Mayor with an
+optional *draft* cleanup PR — a draft goes ready only after you or the
+Mayor approve it. The **Imperator** patrols for security problems and
+reports **only** to the Mayor: never issues, never PRs, never public posts.
+
+**The refinery.** `town_verify` gathers deterministic git evidence from the
+worktree (status, diff, log) before anyone trusts a report; `town_land`
+commits uncommitted work, pushes the branch to the rig's origin, and moves
+the bead to review. Merges, PRs to default branches, and anything
+irreversible stay yours.
+
+**Town Hall.** A sidebar page with the town problems-first: blocked and
+failed threads under "Needs attention", the convoy board with each bead's
+ready/blocked/running state and linked polecat, the live roster, and an
+activity feed of everything that happened — all updating in real time.
+
+**A deterministic Deacon.** A background supervisor watches thread
+lifecycle events, repairs state from live data, detects stalls, keeps claim
+leases alive, and delivers alerts to the Mayor through a durable outbox
+with retries. No schedulers to babysit.
+
+**Briefs written for smaller models.** Polecat briefs are short sentences,
+one idea per line, zero jargon — and models are layered: the Mayor, five
+polecat tiers, reviewers, and patrol roles each have their own
+provider/model/reasoning settings. Orchestrate with a strong model; sling
+well-defined tasks to cheaper ones.
+
+**Clean artifacts.** Town vocabulary stays in the town. Commits, PRs, and
+comments in your repositories read like normal engineering work — no
+beads, polecats, or Mayors in them.
+
+## How it works
+
+| Concept | Mechanism |
 | --- | --- |
 | Town | A bb project holding the `.beads` ledger and `town.md` rules |
-| Mayor | One visible thread in the town project, granted `town_*` orchestration tools |
-| Rig | Any bb project registered with the plugin |
-| Polecat | A worker thread in a rig project, spawned in a bb-managed worktree |
-| Hook | bb's managed worktree (setup/teardown/cleanup owned by bb) |
+| Mayor | One visible thread in the town project, granted `town_*` tools |
+| Rig | Any bb project registered with the plugin (cloned on request) |
+| Polecat | A worker thread in a rig project, in a bb-managed worktree |
 | Bead / Convoy | `bd` work items and epics in the town ledger; plugin maps bead ↔ thread |
-| Sling / Nudge | `town_sling` / `town_nudge` tools → `threads.spawn` / `threads.send` |
+| Sling / Nudge | `town_sling` / `town_nudge` → `threads.spawn` / `threads.send` |
 | Report | `polecat_report` (ready/blocked) → durable outbox → Mayor thread |
-| Deacon (patrol) | Background supervisor service on thread events + stall detection |
-| Witness | Read-only reviewer thread spawned in the worker's worktree |
-| Refinery | Mayor verification → branch push → bead to review → owner decides |
-| Seance | Durable bb threads reopen with context; reports persist as bead comments |
-| Feed | Town Hall dashboard page: problems-first roster, convoy board, activity |
+| Deacon | Background supervisor: reconcile, stall detection, lease heartbeats |
+| Refinery | `town_verify` → `town_review` → `town_land` → `town_complete` |
+| Town Hall | Dashboard page: problems, convoy board, roster, activity feed |
 
-The plugin never keeps a parallel work ledger: Beads is the single source of
-truth. Plugin storage holds only the bead↔thread mapping, rig registry, and
-the alert outbox.
+Polecats run `accept-edits` by default: they can edit freely inside their
+own worktree, and everything beyond it — pushes, merges, external services,
+PRs — flows polecat → Mayor → you.
 
-## Status
-
-Phase 4 — the refinery. The Mayor drives finished work through delivery:
-`town_verify` gathers deterministic git evidence from the polecat's worktree
-(status, diff, log), `town_review` commissions an independent read-only
-reviewer thread in that same worktree (verdicts recorded on the bead;
-repair passes only with explicit authorization), and `town_land` commits any
-uncommitted work, pushes the branch to the rig's origin, and moves the bead
-to a `review` status in the ledger — the owner alone decides the merge path.
-Town ledgers register the `review` status at init.
-
-With Phase 3's Town Hall page (problems-first board, roster, activity feed)
-and Phase 2's Beads ledger underneath, the four planned phases are complete:
-madmax is a full Gas Town for bb.
-
-Rigs are conversational, too: tell the Mayor "I'd like to make a PR for
-<github repo> to fix <issue>" and it can bring the repo in itself —
-`town_create_rig` clones the repo into the town's `rigs/` directory
-(quietly excluded from the town repo's status) and registers it as a rig;
-the Mayor reads the issue with `gh` in its shell, slings a bead tagged with
-the rig, and lands the branch when the work verifies. Opening the PR is
-owner-approved at dispatch and travels in the polecat's brief (`openPr:
-true`).
-
-Reviews are adversarial and structured. `town_review` commissions deep
-reviews of a polecat's work before it lands: lite mode (one reviewer) or
-full mode (one reviewer per criterion — security, maintainability,
-performance, quality, or your own), each working as a persona you name.
-Every review runs three phases — findings with HIGH/MEDIUM/LOW confidence,
-verification of the HIGH findings, then a compiled ship/fix verdict — and
-the Mayor drives the fix loop until the verdict is clean. `town_pr_review`
-reviews *someone else's* pull request the same way: it finds or creates
-the rig, mints a dedicated bead, and spawns reviewer threads that check
-out the PR; the Mayor compiles findings and drafts the PR response
-(approve, comment, request changes) — the owner decides whether to post.
-
-Briefs are written for simpler models: short sentences, one idea per
-line, no jargon — the town vocabulary lives with the Mayor, not in the
-briefs. And models are layered the Gas Town way: the Mayor runs its own
-provider/model, five polecat tiers each carry theirs, and reviewers and
-patrol roles have separate settings.
-
-Quick start — the town asks where it should live the first time you start it.
-On bb's New Thread screen, the Madmax section offers importing an existing
-project or creating a dedicated folder (recommended); or from the CLI:
+## Install
 
 ```
-bb madmax init --project <proj-id>        # import an existing town project
-bb madmax init --path <dir> --name <name>  # create a dedicated town folder
-bb madmax rig add <proj-id>               # register a rig
-bb madmax ledger status                   # ledger health and bead counts
+bb plugin install git:https://github.com/jgnagy/bb-plugin-madmax.git@semver:^0.2.0
 ```
 
-(`bb madmax start` with no town configured prints the same choices; the town
-project can also be set directly with `bb plugin config madmax set
-townProject <proj-id>`, and moving an established town requires that command.
-`bd` 1.0+ must be on the bb server machine's PATH for the ledger.)
+Install [Beads](https://github.com/gastownhall/beads) (`bd` 1.0+) on the
+machine running the bb server and put it on `PATH` — it is the ledger.
+`git` and `gh` (authenticated) are used for cloning, verification, delivery,
+and pull requests.
 
-Roadmap:
+## Using the town
 
-- [x] Phase 1 — core: roles, section, spawn/sling across rigs, outbox, supervisor
-- [x] Phase 2 — Beads layer: `bd` shell-out, convoys, bead↔thread linkage
-- [x] Phase 3 — Town Hall UI: problems view, convoy board, roster, feed
-- [x] Phase 4 — refinery: verify, deliver, reviewer threads, landing flow
+**First run**, the town asks where it should live. On bb's New Thread
+screen, the Madmax section offers importing an existing project or creating
+a dedicated folder (recommended — it gets a git repo, a Beads ledger, and a
+rules starter). From the CLI:
 
-Later, if the town wants them: molecules/formulas (`bd cook`), scheduler
-capacity (compose with bb's concurrency-limit), and Wasteland federation
-via `bd dolt` remotes.
+```
+bb madmax init --project <proj-id>          # import an existing town project
+bb madmax init --path <dir> --name <name>   # create a dedicated town folder
+bb madmax rig add <proj-id>                 # register an existing project as a rig
+```
 
-## Develop
+**Then talk to the Mayor** like any other thread:
+
+- "I'd like to make a PR for `github.com/org/repo` fixing issue #123."
+- "Kick off a PR review of \<link\> and let me know your findings."
+- "Run a cruft sweep on authify — and flag unmaintained dependencies."
+- "Do a security patrol on bullion and tell me what you find."
+
+The Mayor plans convoys, slings beads, dispatches reviewers and patrols,
+and brings you only genuine decisions. Edit `town.md` in the town project
+to change the town's operating rules at any time — the Mayor re-reads them
+on every patrol cycle.
+
+**CLI reference:**
+
+```
+bb madmax status | start | init
+bb madmax ledger init | status
+bb madmax rig list | add | remove | clone
+bb madmax sling --bead <id> | --title "…" --mission "…"
+bb madmax nudge | inspect | review | verify | land <thread-id>
+bb madmax buzzard | imperator --rig <proj-id> | --git-url <url>
+```
+
+Add `--json` to any command when the output drives code; `bb madmax help`
+prints everything.
+
+**Settings** (in bb's plugin settings or `bb plugin config madmax set …`):
+
+| Setting | Purpose |
+| --- | --- |
+| `townProject` | The town's bb project |
+| `simplest`…`mostDifficult` (×3 each) | Provider/model/reasoning per polecat tier |
+| `mayor` / `reviewer` / `buzzard` / `imperator` (×3 each) | Provider/model/reasoning per role |
+| `polecatPermissionMode` | Polecat permissions (`accept-edits` default) |
+| `stallMinutes` | How long an active thread runs before the Mayor is alerted |
+| `rigsDir` | Where cloned rigs live (empty = `<town>/rigs`) |
+| `buzzardCron` / `imperatorCron` | Scheduled patrol crons (empty = off; reload the plugin after changing) |
+| `buzzardUnmaintained` | Buzzard also flags unmaintained dependencies |
+
+## Developing
 
 ```
 npm install
-npm test                # vitest against the fake plugin host
+npm test                # vitest against the fake plugin host (runs real bd)
 npx tsc --noEmit        # typecheck
 bb plugin build         # write dist/
 bb plugin install . --yes
 bb plugin dev           # rebuild + reload on save
-bb plugin types --check
 ```
 
-Requires `bd` 1.0+ on PATH for the ledger (Phase 2+). The full plugin API is
-on disk after `npm install` at
+CI runs the typecheck and the full suite (with `bd` installed) on every
+push. The plugin API ships on disk after `npm install` at
 `node_modules/@get-bb/plugin-sdk/bundled-types/bb-plugin-sdk.d.ts`.
+
+## Lineage
+
+- [Gas Town](https://github.com/gastownhall/gastown) (MIT, retired) — the
+  concepts: town, mayor, rig, polecat, convoy, bead, refinery, GUPP/MEOW/NDI.
+- [Beads / `bd`](https://github.com/gastownhall/beads) — the durable ledger.
+- [Chief for bb](https://github.com/divyesh-puri/bb-plugin-chief) (MIT) —
+  proven bb plugin patterns this plugin builds on.
 
 ## License
 
