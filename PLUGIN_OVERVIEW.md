@@ -1,21 +1,25 @@
-Keep a todo list beside the work it belongs to, in the sidebar and in
-your agent threads.
+Run a Gas Town inside bb: one Mayor thread coordinates polecat worker
+threads across every project you register as a rig.
 
-## What you get
+The Mayor is an ordinary visible BB thread in a sidebar section named **Town**.
+Talk to it like any other thread. It slings each self-contained work item to a
+polecat — a worker thread in its own managed worktree, running on the model
+tier the work deserves (five tiers, from trivial lookups to adversarial
+reviews). Polecats are ordinary visible threads too: watch them live, read
+their transcripts, or take over mid-turn.
 
-- An **Example todos** page in the left sidebar that adds, completes, and
-  removes todos.
-- A `bb madmax` command that does the same from a terminal.
-- Live updates, so a change made in one place reaches every open page at once.
+Polecats never escape their worktree. They report **ready** evidence or
+**blocked** with a recommendation; only the Mayor decides when work is
+verified and complete. Anything outside a worktree — pushes, merges, external
+services, main branches — flows polecat → Mayor → owner.
 
-## How it works
+A deterministic patrol replaces fragile schedulers: a background supervisor
+watches thread lifecycle events, reconciles live state, detects stalls, and
+delivers alerts to the Mayor through a durable outbox that retries after
+transient failures. A stuck polecat gets surfaced before you ever think to
+check on it.
 
-The todos live in this plugin's own storage on the BB server, one list per
-installation. Nothing leaves the machine, and the plugin needs no account, API
-key, or external service.
-
-## For agents
-
-The bundled skill tells an agent to read the list with `bb madmax list`, add
-one todo at a time with `bb madmax add`, and close finished work with
-`bb madmax done`.
+Work runs across projects: register any BB project as a rig and the Mayor can
+sling into it, each polecat isolated in its own worktree on its own branch.
+Drive everything from the thread UI, the `bb madmax` CLI, or agent tools the
+Mayor and polecats carry automatically.

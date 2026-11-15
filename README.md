@@ -50,14 +50,25 @@ the alert outbox.
 
 ## Status
 
-Phase 0 — scaffold. The current code is the `bb plugin new` example (a todo
-list) kept as a live reference for the RPC/CLI/skill/realtime surfaces; it will
-be replaced by the town supervisor.
+Phase 1 — the town core, installed and running. One Mayor thread in the town
+project slings work items to polecat threads across registered rigs (five
+model tiers, managed worktrees, `accept-edits` by default), polecats report
+ready/blocked through `polecat_report`, a deterministic Deacon supervisor
+patrols thread lifecycle with a durable alert outbox, and the New Thread
+screen gets a Start Mayor launcher with a live town summary.
+
+Quick start:
+
+```
+bb plugin config madmax set townProject <proj-id>   # the town bb project
+bb madmax start                                     # spawn the Mayor thread
+bb madmax rig add <proj-id>                         # register a rig
+```
 
 Roadmap:
 
-- [ ] Phase 1 — core: roles, section, spawn/sling across rigs, outbox, supervisor
-- [ ] Phase 2 — Beads layer: `bd` shell-out, convoys, skills (mayor, polecat)
+- [x] Phase 1 — core: roles, section, spawn/sling across rigs, outbox, supervisor
+- [ ] Phase 2 — Beads layer: `bd` shell-out, convoys, bead↔thread linkage
 - [ ] Phase 3 — Town Hall UI: problems view, convoy board, roster, feed
 - [ ] Phase 4 — refinery: verify, deliver, reviewer threads, landing flow
 
@@ -65,10 +76,11 @@ Roadmap:
 
 ```
 npm install
-bb plugin build        # write dist/
-bb plugin install .    # install into bb
-bb plugin dev          # rebuild + reload on save
-npx tsc --noEmit       # typecheck
+npm test                # vitest against the fake plugin host
+npx tsc --noEmit        # typecheck
+bb plugin build         # write dist/
+bb plugin install . --yes
+bb plugin dev           # rebuild + reload on save
 bb plugin types --check
 ```
 

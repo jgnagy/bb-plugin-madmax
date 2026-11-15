@@ -1,198 +1,176 @@
-// bb-plugin-madmax — a BB plugin frontend entry.
+// bb-plugin-madmax — the town frontend.
 //
-// Compiled by `bb plugin build` into dist/app.js + dist/app.css. React and
-// @get-bb/plugin-sdk/app are provided by the BB app at load time (never bundled),
-// so this file must be loaded by BB, not imported directly.
-//
-// The components under components/ui/ are YOURS: vendored source (shadcn
-// model), edit freely. Add more from the BB registry with
-// `npx shadcn add @bb/<name>` (see components.json) — dropdowns, tables,
-// the full shadcn set, version-matched to this BB install. Run
-// `npm install` once before `bb plugin build`.
+// Phase 1 surface: a "Start Mayor" launcher on bb's New Thread screen with a
+// live town summary (problems first), and a role badge on managed threads'
+// sidebar rows. Phase 3 replaces the summary with the full Town Hall
+// dashboard.
 import { useCallback, useEffect, useState } from "react";
-import type { FormEvent, ReactNode } from "react";
-import { definePluginApp, useRealtime, useRpc } from "@get-bb/plugin-sdk/app";
-import type { rpcContract, Todo } from "./server";
+import {
+  definePluginApp,
+  useBbNavigate,
+  useRealtime,
+  useRpc,
+} from "@get-bb/plugin-sdk/app";
+import type { PluginSidebarThread } from "@get-bb/plugin-sdk/app";
+import type { ManagedThread, Rig, rpcContract } from "./server";
 import { Button } from "@/components/ui/button";
-import { Checkbox } from "@/components/ui/checkbox";
 import { Icon } from "@/components/ui/icon";
-import { Input } from "@/components/ui/input";
-import { cn } from "@/lib/utils";
 
-/** The todo list, kept current by the server's "todos-changed" signal. */
-function useTodos() {
+type TownStatus = {
+  sectionId: string | null;
+  townProjectId: string | null;
+  mayor: ManagedThread | null;
+  threads: ManagedThread[];
+  rigs: Rig[];
+};
+
+const PROBLEM_STATES = new Set(["blocked", "failed"]);
+
+function useTownStatus() {
   const rpc = useRpc<typeof rpcContract>();
-  const [todos, setTodos] = useState<Todo[] | null>(null);
+  const [status, setStatus] = useState<TownStatus | null>(null);
   const [error, setError] = useState<string | null>(null);
-  const report = useCallback((cause: unknown) => {
-    setError(cause instanceof Error ? cause.message : String(cause));
-  }, []);
   const refetch = useCallback(() => {
-    rpc.call("todos_list").then((result) => {
-      setTodos(result.todos);
+    rpc.call("status", null).then((result) => {
+      setStatus(result);
       setError(null);
-    }, report);
-  }, [rpc, report]);
+    }, (cause: unknown) => {
+      setError(cause instanceof Error ? cause.message : String(cause));
+    });
+  }, [rpc]);
   useEffect(() => {
     refetch();
   }, [refetch]);
-  // server.ts publishes after every write — from this page, another window,
-  // or `bb madmax add` run by an agent — so the list never goes stale.
-  useRealtime("todos-changed", refetch);
-  return { rpc, todos, error, report, refetch };
+  // The server publishes after every town mutation — slings, reports,
+  // lifecycle events — from this window, another window, or the CLI.
+  useRealtime("town-changed", refetch);
+  return { rpc, status, error };
 }
 
-function TodoRow({
-  todo,
-  onToggle,
-  onRemove,
-}: {
-  todo: Todo;
-  onToggle: (done: boolean) => void;
-  onRemove: () => void;
-}) {
-  return (
-    <li className="flex items-center gap-3 py-2.5 text-sm">
-      <Checkbox
-        checked={todo.done}
-        onCheckedChange={(checked) => onToggle(checked === true)}
-        aria-label={`Mark "${todo.title}" ${todo.done ? "not done" : "done"}`}
-      />
-      <span
-        className={cn(
-          "min-w-0 flex-1 truncate",
-          todo.done && "text-muted-foreground line-through",
-        )}
-      >
-        {todo.title}
-      </span>
-      <span className="hidden font-mono text-xs text-muted-foreground sm:inline">
-        {todo.id}
-      </span>
-      <Button
-        variant="ghost"
-        size="icon"
-        className="size-7 text-muted-foreground hover:text-foreground"
-        aria-label={`Remove "${todo.title}"`}
-        onClick={onRemove}
-      >
-        <Icon name="Trash2" className="size-4" />
-      </Button>
-    </li>
-  );
-}
+function TownSection({ projectId }: { projectId: string | null }) {
+  const navigate = useBbNavigate();
+  const { rpc, status, error } = useTownStatus();
+  const [isStarting, setIsStarting] = useState(false);
+  const [startError, setStartError] = useState<string | null>(null);
 
-/** The dashed box BB's own list pages use for loading and empty states. */
-function EmptyState({ children }: { children: ReactNode }) {
-  return (
-    <div
-      role="status"
-      className="rounded-lg border border-dashed border-border px-4 py-6 text-center text-sm text-muted-foreground"
-    >
-      {children}
-    </div>
-  );
-}
-
-// Tailwind classes compile against the host theme's live CSS variables —
-// derive colors from the theme tokens, never hardcoded grays. The frame
-// (scrolling page, centered column) matches BB's own nav-panel pages.
-function TodosPage() {
-  const { rpc, todos, error, report, refetch } = useTodos();
-  const [title, setTitle] = useState("");
-  const [pending, setPending] = useState(false);
-  const add = async (event: FormEvent<HTMLFormElement>) => {
-    event.preventDefault();
-    const next = title.trim();
-    if (next === "" || pending) return;
-    setPending(true);
+  const start = useCallback(async () => {
+    if (projectId === null || isStarting) return;
+    setStartError(null);
+    setIsStarting(true);
     try {
-      await rpc.call("todos_add", { title: next });
-      setTitle("");
-      refetch();
+      const result = await rpc.call("start", { projectId });
+      navigate.toThread(result.threadId);
     } catch (cause) {
-      report(cause);
-    } finally {
-      setPending(false);
+      setStartError(cause instanceof Error ? cause.message : String(cause));
+      setIsStarting(false);
     }
-  };
-  const doneCount = todos?.filter((todo) => todo.done).length ?? 0;
+  }, [isStarting, navigate, projectId, rpc]);
+
+  const polescatThreads = status?.threads.filter((thread) => thread.role !== "mayor") ?? [];
+  const problems = polescatThreads.filter((thread) => PROBLEM_STATES.has(thread.state));
+  const working = polescatThreads.filter((thread) => ["active", "starting", "pending"].includes(thread.state));
+  const ready = polescatThreads.filter((thread) => thread.state === "ready");
+
   return (
-    <div className="h-full min-h-0 flex-1 overflow-y-auto">
-      <div className="mx-auto box-border w-full max-w-3xl px-4 pb-4 pt-3 md:px-5 md:pt-4">
-        <p className="text-sm text-muted-foreground">
-          Agents keep this list with <code>bb madmax</code>; the skill in{" "}
-          <code>skills/example-todos</code> tells them how.
-        </p>
-        <form onSubmit={add} className="mt-4 flex items-center gap-2">
-          <Input
-            value={title}
-            onChange={(event) => setTitle(event.target.value)}
-            placeholder="What needs doing?"
-            aria-label="New todo"
-          />
-          <Button type="submit" disabled={pending || title.trim() === ""}>
-            <Icon name="Plus" className="size-4" />
-            Add
-          </Button>
-        </form>
-        {error === null ? null : (
-          <p role="alert" className="mt-3 text-sm text-destructive">
-            {error}
+    <div className="rounded-lg border border-border bg-card text-card-foreground">
+      <div className="flex items-start gap-3 px-6 py-4 text-sm">
+        <div className="min-w-0 flex-1 space-y-2">
+          <p className="text-foreground">
+            {status?.mayor
+              ? `Mayor is ${status.mayor.state} — ${status.mayor.title}`
+              : "No Mayor yet. Start one to coordinate polecat threads across your rigs."}
           </p>
-        )}
-        <div className="mt-4">
-          {todos === null ? (
-            <EmptyState>Loading todos…</EmptyState>
-          ) : todos.length === 0 ? (
-            <EmptyState>
-              Nothing to do. Add one above, or run{" "}
-              <code>bb madmax add "Ship it"</code>.
-            </EmptyState>
-          ) : (
-            <ul className="divide-y divide-border overflow-hidden rounded-lg border border-border bg-card px-4">
-              {todos.map((todo) => (
-                <TodoRow
-                  key={todo.id}
-                  todo={todo}
-                  onToggle={(done) => {
-                    rpc
-                      .call("todos_set_done", { id: todo.id, done })
-                      .then(refetch, report);
-                  }}
-                  onRemove={() => {
-                    rpc
-                      .call("todos_remove", { id: todo.id })
-                      .then(refetch, report);
-                  }}
-                />
-              ))}
-            </ul>
-          )}
+          {startError ?? error !== null ? (
+            <p role="alert" className="text-destructive">
+              {startError ?? error}
+            </p>
+          ) : null}
+          {status !== null && polescatThreads.length > 0 ? (
+            <p className="text-muted-foreground">
+              {problems.length > 0 ? (
+                <span className="text-destructive">
+                  {problems.length} need attention —{" "}
+                  {problems.map((thread) => thread.title).join(", ")}
+                </span>
+              ) : (
+                <>
+                  {working.length} working · {ready.length} awaiting verification
+                </>
+              )}
+              {status.rigs.length > 0 ? (
+                <> · rigs: {status.rigs.map((rig) => rig.name).join(", ")}</>
+              ) : null}
+            </p>
+          ) : null}
         </div>
-        {todos !== null && todos.length > 0 ? (
-          <p className="mt-2 text-xs text-muted-foreground">
-            {doneCount} of {todos.length} done
-          </p>
-        ) : null}
+        <Button
+          disabled={projectId === null || isStarting || status?.mayor !== null}
+          onClick={() => void start()}
+        >
+          <Icon name="Landmark" className="size-4" />
+          {status?.mayor ? "Mayor running" : isStarting ? "Starting…" : "Start Mayor"}
+        </Button>
       </div>
     </div>
   );
 }
 
-// The default export must be definePluginApp(...); BB interprets it after
-// loading the bundle. navPanel adds a page to the left sidebar; register
-// other UI under app.slots and composer actions, plus-menu rows, banners, or
-// rich-text rules with app.composer.customize(...) (see the bb guide's
-// plugins chapter).
+type TownRoles = Record<string, { role: ManagedThread["role"]; tier: string | null; state: string }>;
+
+/** One batched read for every thread a list may show (see useData contract). */
+function useTownRoles(): TownRoles | null {
+  const rpc = useRpc<typeof rpcContract>();
+  const [roles, setRoles] = useState<TownRoles | null>(null);
+  const load = useCallback(() => {
+    rpc.call("status", null).then((result) => {
+      const next: TownRoles = {};
+      for (const thread of result.threads) {
+        next[thread.threadId] = { role: thread.role, tier: thread.tier, state: thread.state };
+      }
+      setRoles(next);
+    }).catch(() => setRoles({}));
+  }, [rpc]);
+  useEffect(() => {
+    load();
+  }, [load]);
+  useRealtime("town-changed", load);
+  return roles;
+}
+
+function TownRowBadge({
+  thread,
+  data,
+}: {
+  thread: PluginSidebarThread;
+  data: TownRoles | null;
+}) {
+  const entry = data?.[thread.id];
+  if (!entry) return null;
+  const label =
+    entry.role === "mayor"
+      ? "Mayor"
+      : `${entry.role === "polecat" ? "Polecat" : "Reviewer"}${entry.tier ? ` · ${entry.tier}` : ""}`;
+  return (
+    <span
+      title={`${label} — ${entry.state}`}
+      className="inline-flex items-center gap-1 text-muted-foreground"
+    >
+      <Icon name={entry.role === "mayor" ? "Landmark" : "Hammer"} className="size-3" />
+      {label}
+    </span>
+  );
+}
+
 export default definePluginApp((app) => {
-  app.slots.navPanel({
-    id: "example-todos",
-    title: "Example todos",
-    icon: "ListTodo",
-    // Routed at /plugins/madmax/example-todos; the component receives the
-    // remainder as `subPath` for deep links within the page.
-    path: "example-todos",
-    component: TodosPage,
+  app.slots.homepageSection({
+    id: "madmax-town",
+    title: "Madmax",
+    component: TownSection,
+  });
+  app.slots.experimental_threadRowMetadata({
+    id: "madmax-role",
+    order: 10,
+    useData: () => useTownRoles(),
+    component: TownRowBadge,
   });
 });
