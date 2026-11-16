@@ -758,16 +758,26 @@ export default async function plugin(bb: BbPluginApi) {
     return bdAvailable;
   }
 
+  /** The town's default local source: the checkout the ledger lives in. */
+  async function townSource(projectIdOverride?: string): Promise<{ path: string; hostId: string } | null> {
+    const townProjectId = projectIdOverride ?? (await configuredTownProject());
+    if (!townProjectId) return null;
+    try {
+      const project = await bb.sdk.projects.get({ projectId: townProjectId });
+      const source = project.sources?.find((candidate) => candidate.isDefault) ?? project.sources?.[0];
+      return source ? { path: source.path, hostId: source.hostId } : null;
+    } catch {
+      return null;
+    }
+  }
+
   /** The town checkout path, from the town project's default local source. */
   async function townLedgerDir(): Promise<string> {
+    const source = await townSource();
+    if (source) return source.path;
     const townProjectId = await configuredTownProject();
     if (!townProjectId) throw new Error(await noTownMessage());
-    const project = await bb.sdk.projects.get({ projectId: townProjectId });
-    const source = project.sources.find((candidate) => candidate.isDefault) ?? project.sources[0];
-    if (!source) {
-      throw new Error("The town project has no local source; the ledger needs a checkout on the bb server's machine.");
-    }
-    return source.path;
+    throw new Error("The town project has no local source; the ledger needs a checkout on the bb server's machine.");
   }
 
   async function runBd(args: string[]): Promise<string> {
@@ -931,6 +941,8 @@ export default async function plugin(bb: BbPluginApi) {
     const prompt = [
       `You are the Mayor of ${name} — the town's chief-of-staff agent. You coordinate work across the town's registered rig projects through visible polecat threads.`,
       "",
+      "You run directly in the town checkout, not a worktree. The owner sees the same files you do. bd run from your shell reads the town ledger.",
+      "",
       "Use town_sling to start one polecat per self-contained work item; choose the model tier honestly (simplest for trivial mechanical work, small for lookups and single-file changes, medium for multi-file features, difficult for tricky logic, mostDifficult for adversarial or security-sensitive work).",
       "When the owner names a repository the town doesn't know, create the rig yourself with town_create_rig (give it the git URL); read GitHub issues with gh in your shell.",
       "Use town_roster for the town's threads. Before deciding, use town_inspect to read a thread's live status, persisted report, and last assistant output. Reports are evidence, not proof — verify with town_verify and commission independent reviews with town_review.",
@@ -941,9 +953,19 @@ export default async function plugin(bb: BbPluginApi) {
       "", "## Town rules", rules,
       "", "Acknowledge the rules briefly, inspect the roster, and wait for work.",
     ].join("\n");
+    // The Mayor runs directly in the town checkout — never a worktree — so
+    // the owner and the Mayor see the same files and `bd` finds the town
+    // ledger from the Mayor's shell, whatever the owner's default
+    // new-thread environment is.
+    const source = await townSource(target);
+    if (!source) {
+      bb.log.warn("Town project has no local source; the Mayor runs on the project's default environment instead of the town checkout.");
+    }
     const thread = await bb.sdk.threads.spawn({
       projectId: target,
-      environment: { type: "project-default" },
+      environment: source
+        ? { type: "host", hostId: source.hostId, workspace: { type: "unmanaged", path: source.path } }
+        : { type: "project-default" },
       sectionId,
       visibility: "visible",
       title,

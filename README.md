@@ -14,7 +14,9 @@ lives in Beads, so it survives session loss, plugin reloads, and bb itself.
 ## Features
 
 **One Mayor, many rigs.** The Mayor is an ordinary visible bb thread in the
-town project. Rigs are any bb projects you register — including repos the
+town project — and it runs directly in the town checkout, never a
+worktree, so what it sees is what you see and `bd` in its shell reads the
+town ledger. Rigs are any bb projects you register — including repos the
 Mayor clones itself when you name one it doesn't know. Polecats are ordinary
 visible threads too: watch them live, read their transcripts, or take over
 mid-turn.
@@ -113,13 +115,29 @@ PRs — flows polecat → Mayor → you.
 ## Install
 
 ```
-bb plugin install git:https://github.com/jgnagy/bb-plugin-madmax.git@semver:^0.2.0
+bb plugin install git:https://github.com/jgnagy/bb-plugin-madmax.git@semver:>=0.4.0
 ```
 
 Install [Beads](https://github.com/gastownhall/beads) (`bd` 1.0+) on the
 machine running the bb server and put it on `PATH` — it is the ledger.
 `git` and `gh` (authenticated) are used for cloning, verification, delivery,
-and pull requests.
+and pull requests. The `>=` range floats across 0.x minors so
+`bb plugin update madmax` picks up new releases; a caret range (`^0.4.0`)
+would pin the minor.
+
+## Upgrading
+
+```
+bb plugin outdated              # see what's available for your install
+bb plugin update madmax         # update, in place — town state survives
+```
+
+Updates re-resolve your recorded range, so a `>=` install picks up every
+new tagged release. The town's durable state is never at risk either way:
+the ledger lives in the town repo, threads and projects belong to bb, and
+only the plugin's small index (the `townProject` setting and the rig
+registry) would need re-pointing after a full `bb plugin remove` +
+reinstall.
 
 ## Using the town
 

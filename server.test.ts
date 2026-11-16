@@ -226,6 +226,9 @@ describe("madmax town backend", () => {
     expect(spawn.title).toBe("Mayor · MyTown");
     expect(spawn.sectionId).toBe("sec_town");
     expect(spawn.visibility).toBe("visible");
+    // Without a resolvable local source, the Mayor falls back to the
+    // project's default environment.
+    expect(spawn.environment).toEqual({ type: "project-default" });
     expect((spawn.prompt as string)).toContain("You are the Mayor of MyTown");
     expect((spawn.prompt as string)).toContain("this thread stays responsive");
     expect((spawn.prompt as string)).toContain("Never run long-blocking commands");
@@ -600,6 +603,18 @@ describe.skipIf(!bdAvailable)("madmax ledger (real bd)", () => {
     };
     return { host, dir, mayorId: started.threadId };
   }
+
+  it("the Mayor runs directly in the town checkout, never a worktree", async () => {
+    const { host, dir } = await makeLedgerHost();
+    const spawns = host.harness.inspection.sdk.callsTo("threads.spawn");
+    const mayorSpawn = spawns[0]![0] as Record<string, unknown>;
+    expect(mayorSpawn.environment).toEqual({
+      type: "host",
+      hostId: "host_1",
+      workspace: { type: "unmanaged", path: dir },
+    });
+    expect(String(mayorSpawn.prompt)).toContain("You run directly in the town checkout");
+  });
 
   it("town_convoy creates an epic with labeled, ordered beads", async () => {
     const { host, dir, mayorId } = await makeLedgerHost();
