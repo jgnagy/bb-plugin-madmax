@@ -282,7 +282,7 @@ function TownHallPage() {
     ) ?? [];
   const roster =
     data?.status.threads
-      .filter((thread) => thread.role !== "mayor" && thread.state !== "complete")
+      .filter((thread) => thread.role !== "mayor" && !["complete", "deleted", "archived"].includes(thread.state))
       .sort((a, b) => a.state.localeCompare(b.state) || a.title.localeCompare(b.title)) ?? [];
 
   return (
@@ -377,7 +377,7 @@ function TownHallPage() {
               {data.convoys.length === 0 && data.looseBeads.length === 0 ? (
                 <p className="text-sm text-muted-foreground">
                   {data.status.ledger?.initialized
-                    ? "No convoys in the ledger yet — the Mayor creates them with town_convoy."
+                    ? "No open beads in the ledger yet — every slung task files one here automatically."
                     : data.status.ledger?.bdAvailable
                       ? "Ledger not initialized — run: bb madmax ledger init"
                       : "bd (Beads) is not installed on the bb server machine."}

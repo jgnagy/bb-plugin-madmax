@@ -1568,6 +1568,29 @@ export default async function plugin(bb: BbPluginApi) {
     if (rigProjectId !== townId && !isRig(rigProjectId)) {
       throw new Error(`Project ${rigProjectId} is not a registered rig. Register it first: bb madmax rig add ${rigProjectId}`);
     }
+    // Every unit of work belongs in the ledger: a direct sling files its own bead.
+    // Without it the pipeline, the stats, and close-out all go blind to the work.
+    if (!bead) {
+      try {
+        await ensureLedger();
+        const description = [
+          mission,
+          ...(params.successCriteria?.length ? ["", "Success criteria:", ...params.successCriteria.map((item) => `- ${item}`)] : []),
+          ...(params.constraints?.length ? ["", "Constraints:", ...params.constraints.map((item) => `- ${item}`)] : []),
+          ...(params.context ? ["", params.context] : []),
+        ].join("\n");
+        const rigRow = (allRigs.all() as RigRow[]).find((row) => row.project_id === rigProjectId);
+        const args = ["create", clip(title, 200), "-d", clip(description, 4_000), "--silent"];
+        if (rigRow) args.push("-l", rigRow.name);
+        const created = (await runBd(args)).trim();
+        const found = await bdJson<Bead[]>(["show", created]);
+        bead = found[0] ?? null;
+        if (bead) invalidateLedger();
+      } catch (error) {
+        // Town without a working ledger: sling anyway, but say so loudly.
+        bb.log.warn(`Slung “${title}” without a ledger bead (bd unavailable?): ${String(error)}`);
+      }
+    }
     if (bead) {
       await runBd(["update", bead.id, "--claim"]);
       invalidateLedger();
@@ -2936,7 +2959,7 @@ export default async function plugin(bb: BbPluginApi) {
 
   bb.agents.registerTool({
     name: "town_sling",
-    description: "Sling one clearly titled, self-contained work item to a polecat worker thread in its own managed worktree.",
+    description: "Sling one clearly titled, self-contained work item to a polecat worker thread in its own managed worktree. A bead is filed in the town ledger automatically when none is given, so the work shows up on the board.",
     parameters: slingParams,
     async execute(params, context) {
       const caller = context.threadId ? roles.get(context.threadId) : undefined;
@@ -2944,7 +2967,7 @@ export default async function plugin(bb: BbPluginApi) {
         throw new Error("town_sling requires an active registered Mayor thread.");
       }
       const result = await sling(params, context.threadId);
-      return `Slung “${result.title}” to a polecat in thread ${result.threadId} (tier ${result.tier}, project ${result.projectId}). Track it with town_roster.`;
+      return `Slung “${result.title}” to a polecat in thread ${result.threadId} (tier ${result.tier}, project ${result.projectId}${result.beadId ? `, bead ${result.beadId}` : ""}). Track it with town_roster.`;
     },
   });
   bb.agents.registerTool({

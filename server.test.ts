@@ -1378,6 +1378,26 @@ describe.skipIf(!bdAvailable)("madmax ledger (real bd)", () => {
     expect(after.ledger?.initialized).toBe(true);
     expect(after.ledger?.path).toBe(dir);
   });
+  it("a direct sling auto-files a bead in the ledger", async () => {
+    const { host, dir, mayorId } = await makeLedgerHost();
+    await host.harness.behavior.callAgentTool(
+      "town_sling",
+      { title: "Fix the flux capacitor", mission: "It does not charge under alternating current.", successCriteria: ["charges to 1.21 jigawatts"] },
+      { threadId: mayorId },
+    );
+    const beads = await bdList(dir);
+    const bead = beads.find((issue) => issue.title === "Fix the flux capacitor");
+    expect(bead, "auto-created bead exists in the ledger").toBeDefined();
+    expect(bead!.status).toBe("in_progress");
+    expect(bead!.description).toContain("jigawatts");
+
+    const status = (await host.harness.behavior.callRpc("status", null)) as {
+      threads: { threadId: string; role: string; beadId: string | null }[];
+    };
+    const polecat = status.threads.find((thread) => thread.role === "polecat")!;
+    expect(polecat.beadId).toBe(bead!.id);
+  });
+
   it("a polecat requests its own review; findings route back to the polecat; re-review works after reporting", async () => {
     const { host, dir, mayorId } = await makeLedgerHost();
     const polecatId = await slingFirstBead(host, dir, mayorId);

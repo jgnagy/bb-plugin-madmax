@@ -23,7 +23,8 @@ mid-turn.
 
 **A real work ledger.** Convoys are epics, beads are the work items, rig
 names are labels that route slings. Beads are claimed at sling time and
-closed at verified completion, every polecat report lands on its bead as a
+closed at verified completion — slinging a task files its bead automatically,
+so nothing goes untracked — every polecat report lands on its bead as a
 comment, and claim leases are kept alive by the patrol while work runs.
 `bd` is the single source of truth — the plugin never keeps a parallel
 ledger, and your own `bd` commands interoperate with the town's.
