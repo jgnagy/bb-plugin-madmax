@@ -181,6 +181,33 @@ describe("madmax town backend", () => {
     expect(rePointed?.mayorThreadId).toBe("thr_new_mayor");
   });
 
+  it("reconcile repairs a managed thread bb left untitled", async () => {
+    const host = await makeHost();
+    const { started } = await startTown(host);
+    host.harness.inspection.sdk.stub("threads.update", () => ({ ok: true }));
+    // The live thread lost its title (a past buggy spawn passed none).
+    host.harness.inspection.sdk.stub("threads.get", (args: { threadId: string }) =>
+      makeThreadResponse({
+        id: args.threadId,
+        status: "idle",
+        title: null,
+        deletedAt: null,
+        archivedAt: null,
+        sectionId: "sec_town",
+        visibility: "visible",
+      }));
+
+    const again = await host.harness.behavior.callRpc("start", { projectId: "proj_town" });
+    expect((again as { created: boolean }).created).toBe(false);
+    const updates = host.harness.inspection.sdk.callsTo("threads.update");
+    const titleUpdate = updates.find(
+      (args: unknown[]) => typeof args[0] === "object" && args[0] !== null && "title" in (args[0] as object),
+    );
+    expect(titleUpdate).toBeDefined();
+    expect((titleUpdate![0] as { threadId: string; title: string }).threadId).toBe(started.threadId);
+    expect((titleUpdate![0] as { title: string }).title).toBe("Mayor · MyTown");
+  });
+
   it("reports an empty town before setup", async () => {
     const host = await makeHost();
     const status = (await host.harness.behavior.callRpc("status", null)) as {
@@ -675,6 +702,7 @@ describe.skipIf(!bdAvailable)("madmax ledger (real bd)", () => {
     // The authify label routed the polecat into the registered rig project.
     const spawns = host.harness.inspection.sdk.callsTo("threads.spawn");
     const polecatSpawn = spawns[spawns.length - 1]![0] as Record<string, unknown>;
+    expect(polecatSpawn.title).toBe("Add login endpoint");
     expect(polecatSpawn.projectId).toBe("proj_rig");
     expect((polecatSpawn.pluginMetadata as Record<string, unknown>).beadId).toBe(bead.id);
     // The bead id travels in metadata only — never in the brief text, and

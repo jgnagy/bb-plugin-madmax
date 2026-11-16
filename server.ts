@@ -1256,7 +1256,7 @@ export default async function plugin(bb: BbPluginApi) {
       },
       sectionId,
       visibility: "visible",
-      title: params.title,
+      title,
       permissionMode,
       parentThreadId: mayor.thread_id,
       lifecycleOwnerThreadId: mayor.thread_id,
@@ -2111,6 +2111,15 @@ export default async function plugin(bb: BbPluginApi) {
         await bb.sdk.threads.update({ threadId: row.thread_id, sectionId, visibility: "visible" });
       } catch (error) {
         bb.log.warn(`Transient thread filing failure for ${row.thread_id}; will retry: ${String(error)}`);
+      }
+    }
+    // Repair a thread bb left untitled (e.g. spawned without title at a
+    // buggy version) by re-asserting the title we track it under.
+    if (thread.title === null && row.title) {
+      try {
+        await bb.sdk.threads.update({ threadId: row.thread_id, title: row.title });
+      } catch (error) {
+        bb.log.warn(`Transient title repair failure for ${row.thread_id}; will retry: ${String(error)}`);
       }
     }
     const nextState = stateFromLive(row, thread.status) as ManagedRow["state"];
