@@ -427,6 +427,7 @@ interface ManagedRow {
   active_cycle: number;
   stall_alerted_cycle: number | null;
   review_requested_by: string | null;
+  last_report_at: number | null;
   created_at: number;
   updated_at: number;
 }
@@ -661,6 +662,7 @@ export default async function plugin(bb: BbPluginApi) {
       created_at INTEGER NOT NULL
     )`,
     `ALTER TABLE rigs ADD COLUMN forge TEXT`,
+    `ALTER TABLE town_threads ADD COLUMN last_report_at INTEGER`,
   ]);
 
   const allRows = db.prepare(`SELECT * FROM town_threads ORDER BY created_at ASC`);
@@ -1287,7 +1289,7 @@ export default async function plugin(bb: BbPluginApi) {
       "When the owner names a repository the town doesn't know, create the rig yourself with town_create_rig (give it the git URL). The town works with GitHub, GitLab, and Gitea/Forgejo: a rig's forge is inferred from its remote URL (github.com, gitlab.com, codeberg.org, forgejo/gitea hosts). If the host does not identify the forge — for example a homelab server such as https://git.home — do not guess: ask the owner which forge it is and record the answer with town_set_rig_forge. Do the same whenever a forge command fails with a CLI error that looks like a mis-detection.",
       "Use town_roster for the town's threads. Before deciding, use town_inspect to read a thread's live status, persisted report, and last assistant output. Reports are evidence, not proof — verify with town_verify.",
       "Use town_nudge to answer a polecat's question or correct course; steer only a thread working something wrong right now.",
-      "Polecats report ready or blocked; only you decide when work is verified. Polecats request their own adversarial review in their worktree and fix the findings before reporting ready — review is part of their loop, not a gate you run. town_review stays yours for owner-commissioned deep dives (a persona and criteria you name). Verify with town_verify before landing, land verified work with town_land (branch pushed, bead to review), and mark it complete with town_complete (it closes the bead and archives the thread once no reviewer is still running). The town watches pull requests your polecats open: when one merges, the bead closes and the thread is completed and archived automatically — no action needed from you. To review someone else's pull request, use town_pr_review — it mints the bead and the reviewer threads; you compile findings and draft the PR response, and the owner decides posting. Escalate to the owner only genuine product decisions, credentials, external accounts, and irreversible actions — lead with a recommendation and the evidence.",
+      "Polecats report ready or blocked; only you decide when work is verified. Polecats request their own adversarial review in their worktree and fix the findings before reporting ready — review is part of their loop, not a gate you run. town_review stays yours for owner-commissioned deep dives (a persona and criteria you name); if a fresh verdict on the current work exists it is returned instead of spawning a duplicate — pass force: true only when you genuinely want independent eyes. Verify with town_verify before landing, land verified work with town_land (branch pushed, bead to review), and mark it complete with town_complete (it closes the bead and archives the thread once no reviewer is still running). The town watches pull requests your polecats open: when one merges, the bead closes and the thread is completed and archived automatically — no action needed from you. To review someone else's pull request, use town_pr_review — it mints the bead and the reviewer threads; you compile findings and draft the PR response, and the owner decides posting. Escalate to the owner only genuine product decisions, credentials, external accounts, and irreversible actions — lead with a recommendation and the evidence.",
       "",
       "You are the owner's main interface, so this thread stays responsive. Never run long-blocking commands here — no watching CI (gh run watch), no long builds, no long test suites, no waiting on anything slow. Hand long waits to a polecat as a brief and end your turn; its report wakes you.",
       "", "## Town rules", rules,
@@ -1784,9 +1786,9 @@ export default async function plugin(bb: BbPluginApi) {
       throw new Error(`Managed thread ${threadId} is ${row.state} and can no longer report.`);
     }
     const now = Date.now();
-    db.prepare(`UPDATE town_threads SET state=?, result=?, blocker=?, recommendation=?, active_since=NULL, updated_at=? WHERE thread_id=?`).run(
+    db.prepare(`UPDATE town_threads SET state=?, result=?, blocker=?, recommendation=?, active_since=NULL, updated_at=?, last_report_at=? WHERE thread_id=?`).run(
       params.state, params.result ?? null, params.state === "blocked" ? params.blocker : null,
-      params.recommendation ?? null, now, threadId,
+      params.recommendation ?? null, now, now, threadId,
     );
     reloadRoles();
     publishTown();
@@ -2235,15 +2237,27 @@ export default async function plugin(bb: BbPluginApi) {
   }
 
   /** Commission independent reviews of a polecat's work (lite or full). */
-  async function startReview(threadId: string, specInput: ReviewSpec, requestedBy: "mayor" | "polecat" = "mayor") {
+  async function startReview(threadId: string, specInput: ReviewSpec, requestedBy: "mayor" | "polecat" = "mayor", options: { force?: boolean } = {}) {
     const worker = roles.get(threadId);
     if (!worker || worker.role !== "polecat") throw new Error(`No managed polecat ${threadId}.`);
-    // A reviewer that already reported (ready/blocked) no longer blocks a fresh review.
-    const existing = db
-      .prepare(`SELECT * FROM town_threads WHERE role='reviewer' AND worker_thread_id=? AND state NOT IN ('complete','archived','deleted','ready','blocked')`)
-      .all(threadId) as ManagedRow[];
-    if (existing.length > 0) {
-      return { beadId: worker.bead_id, reviewers: existing.map((row) => ({ threadId: row.thread_id, title: row.title })), created: false };
+    if (!options.force) {
+      // A review already in flight always wins.
+      const existing = db
+        .prepare(`SELECT * FROM town_threads WHERE role='reviewer' AND worker_thread_id=? AND state NOT IN ('complete','archived','deleted','ready','blocked')`)
+        .all(threadId) as ManagedRow[];
+      if (existing.length > 0) {
+        return { beadId: worker.bead_id, reviewers: existing.map((row) => ({ threadId: row.thread_id, title: row.title })), created: false as const };
+      }
+      if (requestedBy === "mayor") {
+        // A verdict reported after the polecat's last report covers the work as it now stands —
+        // spawning another reviewer would double-pay for the same answer.
+        const fresh = db
+          .prepare(`SELECT * FROM town_threads WHERE role='reviewer' AND worker_thread_id=? AND state IN ('ready','blocked') AND COALESCE(last_report_at, 0) >= ? ORDER BY COALESCE(last_report_at, 0) DESC LIMIT 1`)
+          .get(threadId, worker.last_report_at ?? 0) as ManagedRow | undefined;
+        if (fresh) {
+          return { beadId: worker.bead_id, reviewers: [{ threadId: fresh.thread_id, title: fresh.title }], created: false as const, reused: fresh };
+        }
+      }
     }
     const live = await bb.sdk.threads.get({ threadId });
     // A polecat requesting review of its own work is mid-turn by definition; the
@@ -3020,15 +3034,25 @@ export default async function plugin(bb: BbPluginApi) {
   });
   bb.agents.registerTool({
     name: "town_review",
-    description: "Commission an owner-requested adversarial review of a polecat's work, in its own worktree. Polecats request their own reviews in their fix loop; use this only for an owner-commissioned deep dive. Lite: one reviewer covers all criteria. Full: one reviewer per criterion. Reviewers report to you; the polecat's own reviews report to the polecat.",
-    parameters: reviewParams,
+    description: "Commission an owner-requested adversarial review of a polecat's work, in its own worktree. Polecats request their own reviews in their fix loop; use this only for an owner-commissioned deep dive. If a fresh verdict on the current work already exists (e.g. from the polecat's own review), returns it instead of spawning a duplicate — pass force: true to insist on an independent pass. Lite: one reviewer covers all criteria. Full: one reviewer per criterion. Reviewers report to you; the polecat's own reviews report to the polecat.",
+    parameters: reviewParams.extend({
+      force: z.boolean().optional().describe("Spawn a fresh review even when a fresh verdict on the current work already exists."),
+    }),
     async execute(params, context) {
       const caller = context.threadId ? roles.get(context.threadId) : undefined;
       const target = roles.get(params.threadId);
       if (!caller || caller.role !== "mayor" || !target || !belongsToMayor(target, caller.thread_id)) {
         throw new Error(`No managed thread ${params.threadId} for this Mayor.`);
       }
-      const result = await startReview(params.threadId, reviewSpecFrom(params));
+      const result = await startReview(params.threadId, reviewSpecFrom(params), "mayor", { force: params.force });
+      const reused = "reused" in result ? result.reused : undefined;
+      if (reused) {
+        return [
+          `A fresh review of this work already exists: ${reused.title} (${reused.state}). Not spawning a duplicate.`,
+          reused.result ? `Its report:\n${clip(reused.result, 2_000)}` : "No findings summary on record; inspect the reviewer thread for the full report.",
+          "Pass force: true to commission an independent pass anyway.",
+        ].join("\n");
+      }
       const lensList = result.reviewers.map((reviewer) => reviewer.title).join("; ");
       return [
         `${result.created ? "Started" : "Already running"}: ${lensList}.`,

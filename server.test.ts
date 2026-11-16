@@ -1454,6 +1454,74 @@ describe.skipIf(!bdAvailable)("madmax ledger (real bd)", () => {
     expect(host.harness.inspection.sdk.callsTo("threads.spawn").length).toBeGreaterThan(spawns.length);
   });
 
+  it("town_review reuses a fresh verdict instead of spawning a duplicate reviewer", async () => {
+    const { host, dir, mayorId } = await makeLedgerHost();
+    const polecatId = await slingFirstBead(host, dir, mayorId);
+    const reviewers = () =>
+      host.harness.inspection.sdk
+        .callsTo("threads.spawn")
+        .filter((call) => (call[0] as { pluginMetadata?: { role?: string } }).pluginMetadata?.role === "reviewer");
+
+    // The polecat reviews its own work first.
+    await host.harness.behavior.callAgentTool(
+      "polecat_request_review",
+      { mode: "lite" },
+      { threadId: polecatId },
+    );
+    const reviewerId = (await rosterIdsOf(host)).find((t) => t.role === "reviewer")!.threadId;
+    await host.harness.behavior.callAgentTool(
+      "polecat_report",
+      { state: "ready", result: "Findings: none blocking. Verdict: ship." },
+      { threadId: reviewerId },
+    );
+    expect(reviewers()).toHaveLength(1);
+
+    // The Mayor asks for a review of the same work — it must reuse, not respawn.
+    const reused = await host.harness.behavior.callAgentTool(
+      "town_review",
+      { threadId: polecatId },
+      { threadId: mayorId },
+    );
+    expect(String(reused)).toContain("already exists");
+    expect(reviewers()).toHaveLength(1);
+
+    // Force spawns a fresh reviewer even with a fresh verdict on hand.
+    await host.harness.behavior.callAgentTool(
+      "town_review",
+      { threadId: polecatId, force: true },
+      { threadId: mayorId },
+    );
+    expect(reviewers()).toHaveLength(2);
+
+    // The worker files a new report — the old verdict no longer covers the work.
+    const freshReviewer = (await rosterIdsOf(host)).filter((t) => t.role === "reviewer")[1]!;
+    await host.harness.behavior.callAgentTool(
+      "polecat_report",
+      { state: "ready", result: "Found and fixed one HIGH issue. Verdict: ship." },
+      { threadId: freshReviewer.threadId },
+    );
+    await new Promise((resolve) => setTimeout(resolve, 10));
+    await host.harness.behavior.callAgentTool(
+      "polecat_report",
+      { state: "ready", result: "Fixes verified locally." },
+      { threadId: polecatId },
+    );
+    const afterReport = await host.harness.behavior.callAgentTool(
+      "town_review",
+      { threadId: polecatId },
+      { threadId: mayorId },
+    );
+    expect(String(afterReport)).not.toContain("already exists");
+    expect(reviewers().length).toBeGreaterThanOrEqual(3);
+  });
+
+  async function rosterIdsOf(host: Host["host"]) {
+    const status = (await host.harness.behavior.callRpc("status", null)) as {
+      threads: { threadId: string; role: string }[];
+    };
+    return status.threads;
+  }
+
   it("town_review findings route to the Mayor, not the polecat", async () => {
     const { host, dir, mayorId } = await makeLedgerHost();
     const polecatId = await slingFirstBead(host, dir, mayorId);
