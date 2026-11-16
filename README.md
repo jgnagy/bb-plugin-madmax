@@ -115,8 +115,11 @@ PRs — flows polecat → Mayor → you.
 ## Install
 
 ```
-bb plugin install git:https://github.com/jgnagy/bb-plugin-madmax.git@semver:>=0.4.0
+bb plugin install "git:https://github.com/jgnagy/bb-plugin-madmax.git@semver:>=0.4.0" --yes
 ```
+
+(Quote the source: shells otherwise interpret `>=` as a redirection,
+as zsh does by default.)
 
 Install [Beads](https://github.com/gastownhall/beads) (`bd` 1.0+) on the
 machine running the bb server and put it on `PATH` — it is the ledger.
@@ -139,7 +142,7 @@ recorded range — say from `^0.2.0` to 0.4.0 — reinstall:
 
 ```
 bb plugin remove madmax
-bb plugin install git:https://github.com/jgnagy/bb-plugin-madmax.git@semver:>=0.4.0
+bb plugin install "git:https://github.com/jgnagy/bb-plugin-madmax.git@semver:>=0.4.0" --yes
 ```
 
 `remove` clears the plugin's settings (such as `townProject`), so re-set
