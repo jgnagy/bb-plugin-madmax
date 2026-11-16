@@ -25,7 +25,7 @@
     "name": "Madmax",
     "description": "A Gas Town for bb: a Mayor thread slings Beads work to polecat threads across project rigs, with patrol, verification, and landing.",
     "branding": {
-      "icon": "Landmark"
+      "icon": "./icons/mayor.svg"
     },
     "server": "./server.ts",
     "app": "./app.tsx",
