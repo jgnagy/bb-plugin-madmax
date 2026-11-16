@@ -37,3 +37,14 @@ Work runs across projects: register any BB project as a rig and the Mayor can
 sling into it, each polecat isolated in its own worktree on its own branch.
 Drive everything from the thread UI, the `bb madmax` CLI, or agent tools the
 Mayor and polecats carry automatically.
+
+GitHub, GitLab, and Gitea/Forgejo are all first-class. Each rig's forge is
+detected from its remote — github.com and gitlab.com just work, and a
+homelab Gitea gets one question and one answer. Pull-request automation
+(draft PRs, reviews, merged-PR close-out) uses the matching CLI. A rig with
+no usable forge CLI is never broken: polecats push branches and report, and
+you open the request.
+
+Each town also carries its own personality: a `town.md` standing-rules file
+the Mayor maintains, and role-scoped skills (`skills/<role>/`) injected at
+spawn time. Rigs can carry their own town.md too.
