@@ -581,7 +581,6 @@ export default async function plugin(bb: BbPluginApi) {
       name TEXT NOT NULL,
       registered_at INTEGER NOT NULL
     )`,
-    `ALTER TABLE rigs ADD COLUMN forge TEXT`,
     `CREATE TABLE IF NOT EXISTS town_threads (
       thread_id TEXT PRIMARY KEY,
       role TEXT NOT NULL CHECK(role IN ('mayor','polecat','reviewer')),
@@ -661,6 +660,7 @@ export default async function plugin(bb: BbPluginApi) {
       last_checked INTEGER NOT NULL DEFAULT 0,
       created_at INTEGER NOT NULL
     )`,
+    `ALTER TABLE rigs ADD COLUMN forge TEXT`,
   ]);
 
   const allRows = db.prepare(`SELECT * FROM town_threads ORDER BY created_at ASC`);
