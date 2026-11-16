@@ -129,15 +129,22 @@ would pin the minor.
 
 ```
 bb plugin outdated              # see what's available for your install
-bb plugin update madmax         # update, in place — town state survives
+bb plugin update madmax         # update in place — town state survives
 ```
 
-Updates re-resolve your recorded range, so a `>=` install picks up every
-new tagged release. The town's durable state is never at risk either way:
-the ledger lives in the town repo, threads and projects belong to bb, and
-only the plugin's small index (the `townProject` setting and the rig
-registry) would need re-pointing after a full `bb plugin remove` +
-reinstall.
+`update` re-resolves the range your install recorded: a `>=` install
+floats to every new tagged release, while a caret (`^0.4.0`) pins the 0.x
+minor and an exact pin (`0.3.0`) pins the patch. To jump outside the
+recorded range — say from `^0.2.0` to 0.4.0 — reinstall:
+
+```
+bb plugin remove madmax
+bb plugin install git:https://github.com/jgnagy/bb-plugin-madmax.git@semver:>=0.4.0
+```
+
+`remove` clears the plugin's settings (such as `townProject`), so re-set
+them after a reinstall; the town itself is never at risk — the ledger
+lives in the town repo, and threads and projects belong to bb.
 
 ## Using the town
 
