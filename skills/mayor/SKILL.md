@@ -30,7 +30,8 @@ directly with `bd` in the town checkout (reports arrive as bead comments).
 
 | Tool | Effect |
 | --- | --- |
-| `town_create_rig` | Clone a git repository and register it as a town rig, ready to sling into. Use it the moment the owner names a repo the town doesn't know. |
+| `town_create_rig` | Clone a git repository and register it as a town rig, ready to sling into. Use it the moment the owner names a repo the town doesn't know. The forge is inferred from the remote URL; if it isn't obvious (e.g. a homelab host), ask the owner and record it with `town_set_rig_forge`. |
+| `town_set_rig_forge` | Pin (or clear) a rig's forge CLI: `gh`, `glab`, `tea`, `none`, or `auto` (clear the pin and re-infer from the remote). Mixed towns are supported — each rig is judged on its own remote. |
 | `town_convoy` | Create a convoy (epic) with self-contained beads — description must carry what + why + done-when. Order with `dependsOn` (indices of earlier beads). Tag the rig so slings route there automatically. |
 | `town_ready` | List claimable beads (open, unblocked) with their labels. |
 | `town_sling` | Start one polecat per bead (`beadId`), or from a raw title+mission brief. Pick the model tier honestly: `simplest` for trivial mechanical work, `small` for lookups and single-file changes, `medium` for multi-file features, `difficult` (default) for tricky logic, `mostDifficult` for adversarial or security-sensitive work. |
@@ -41,11 +42,11 @@ directly with `bd` in the town checkout (reports arrive as bead comments).
 | `town_adopt` | Bring an existing bb thread into the town — as a polecat (optionally owning a ledger bead) or as the new Mayor (retiring the old one and re-pointing its polecats). Use it for work that predates the town. |
 | `town_adopt_pr` | Adopt a pull request created outside the town: finds or creates the rig, mints a dedicated bead, and spawns a maintainer that keeps CI green and addresses review feedback. Comments, approvals, and merges stay owner-approved. |
 | `town_verify` | Deterministic worktree evidence for a thread: git status, diff stat, recent log. Run this before trusting any report. |
-| `town_review` | Commission an adversarial review of an idle polecat's work, in its own worktree. `mode: "lite"` = one reviewer covering all criteria; `mode: "full"` = one reviewer per criterion. Pass the `persona` the owner names ("a seasoned, high-level Elixir/Phoenix engineer") and custom `criteria`. Reviewers report findings with HIGH/MEDIUM/LOW confidence, verify the HIGH ones, and give a ship/fix verdict. |
+| `town_review` | Commission an adversarial review of a polecat's work, in its own worktree — for owner-commissioned deep dives; polecats normally review themselves before reporting ready. `mode: "lite"` = one reviewer covering all criteria; `mode: "full"` = one reviewer per criterion. Pass the `persona` and `criteria` the owner names. Reviewers report with HIGH/MEDIUM/LOW confidence and a ship/fix verdict. |
 | `town_pr_review` | Review someone else's pull request as a town task: finds or creates the rig, mints a dedicated bead, and spawns reviewer threads in that project that check out the PR. You compile the findings and draft the PR response. |
 | `town_land` | Deliver verified work: commit any uncommitted polecat work, push its branch to the rig's origin, move the bead to review. The owner alone decides the merge. |
 | `town_nudge` | Send a self-contained instruction. Use `steer: true` only to interrupt a thread working something wrong right now; otherwise let it queue. Reviewers stay read-only unless you pass `authorizeEdits: true`. |
-| `town_complete` | Mark a thread complete after verifying its evidence; closes the linked bead in the ledger. |
+| `town_complete` | Mark a thread complete after verifying its evidence; closes the linked bead in the ledger and archives the thread (unless a reviewer is still running — pass `archive: false` to keep it open). |
 
 ## Procedure
 
@@ -67,23 +68,27 @@ A report is a claim. Before delivering work:
 1. **Verify** — `town_verify` gathers deterministic git evidence from the
    worktree (status, diff, log). A report that says "done" without a runnable
    check is not done.
-2. **Review** — for meaningful or risky changes, `town_review` adversarially:
-   `mode: "lite"` for one reviewer, `mode: "full"` for one reviewer per
-   criterion. Pass the persona the owner names ("a seasoned, high-level
-   Elixir/Phoenix software engineer") and their criteria (security,
-   maintainability, performance, quality by default). Reviewers report
-   findings with confidence ratings and verify the HIGH ones. Nudge the
-   worker with the CONFIRMED findings, let it fix them, and repeat the
-   review until the verdict is ship — and CI is green where the project has
-   it. Never wait on CI in this thread: sling a polecat to watch the run
-   and wake you with the result. Review findings land on the bead; they
+2. **Review** — polecats review their own work before reporting ready: they
+   call `polecat_request_review`, address the findings in their worktree,
+   and repeat until the verdict is ship. Their findings arrive in their
+   thread, not yours. `town_review` remains your tool for owner-commissioned
+   deep dives (`mode: "lite"` or `"full"`, a persona, your criteria); those
+   findings report to you. Either way, a report that arrives with an
+   unaddressed review is not done. Never wait on CI in this thread: sling a
+   polecat to watch the run and wake you with the result. Review findings land on the bead; they
    improve the work before it is claimed done.
 3. **Land** — `town_land` commits any uncommitted work, pushes the branch to
    the rig's origin, and moves the bead to review. Pushing a work branch is
    part of delivery; merges, PRs, and default branches wait for the owner —
-   offer the next moves and let the owner choose.
-4. **Complete** — once the owner accepts, `town_complete` the thread; the bead
-   closes in the ledger.
+   offer the next moves and let the owner choose. Any PR a polecat reports
+   is watched: when the forge reports it merged, the bead closes and the
+   thread is completed and archived automatically — no action needed from
+   you. A PR closed unmerged alerts you instead.
+4. **Complete** — once the work is verified (and merged, if it was PR work),
+   `town_complete` the thread; the bead closes in the ledger and the thread is
+   archived so bb cleans up its worktree. If a reviewer is still running,
+   completion proceeds but the archive waits — complete the reviewer first,
+   or pass `archive: false` and archive later.
 4. Escalation flows polecat → Mayor → owner. Resolve what you can from
      settled decisions or the bead; put real decisions to the owner plainly,
      leading with your recommendation and the smallest set of choices, and

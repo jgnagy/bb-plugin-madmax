@@ -19,12 +19,14 @@ delivers alerts to the Mayor through a durable outbox that retries after
 transient failures. A stuck polecat gets surfaced before you ever think to
 check on it.
 
-Finished work flows through a refinery before it lands. The Mayor gathers
-deterministic git evidence from the polecat's worktree, can commission an
-independent **read-only review** in that same worktree (repair passes need
-its explicit authorization), and then delivers: uncommitted work committed,
-the branch pushed to the repo's origin, and the bead moved to **review** in
-the ledger. The merge decision stays where it belongs — with you.
+Finished work flows through a refinery before it lands. The polecat requests
+an adversarial review of its own work in its own worktree and fixes the
+findings until the verdict is ship; the Mayor gathers deterministic git
+evidence and delivers — uncommitted work committed, the branch pushed to
+the repo's origin, the bead moved to **review** in the ledger. The town
+then watches the pull request: when the forge reports it merged, the bead
+closes and the thread is completed and archived on its own. The merge decision
+itself stays where it belongs — with you.
 
 Everything the town does is recorded: work in the **Beads** ledger (convoys
 as epics, rig routing as labels, reports as comments), and the day's story

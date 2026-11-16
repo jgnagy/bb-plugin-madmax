@@ -54,10 +54,17 @@ below was confirmed against the real declarations, not docs.
 - `alert_outbox` (dedupe_key PK, target_thread_id, source_thread_id,
   message, delivered_at, attempts, last_error, created_at) — durable alerts
 - `town_events` (id, at, kind, message, thread_id, bead_id) — activity feed
+- `pr_watch` (url PK, thread_id, bead_id, number, forge, state, failures,
+  last_checked, created_at) — PR/MR references seen in polecat reports; the
+  deacon polls the rig's forge and closes the bead + completes the thread
+  when the forge reports MERGED (merged-PR watch; never archives threads)
 
 **Roles & tools:** Mayor: `town_sling`, `town_nudge`, `town_roster`,
 `town_inspect`, `town_convoy`, `town_ready`, `town_verify`, `town_review`,
-`town_land`, `town_complete`; Polecat/Reviewer: `polecat_report`.
+`town_land`, `town_complete`; Polecat: `polecat_report`,
+`polecat_request_review` (self-review in its own worktree; findings route
+back to the polecat; Mayor-commissioned `town_review` still reports to the
+Mayor); Reviewer: `polecat_report`.
 
 **CLI:** `bb madmax status | start | init | ledger | rig | sling | nudge |
 inspect | review | verify | land`.

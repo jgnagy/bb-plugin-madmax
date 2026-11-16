@@ -15,7 +15,7 @@
 import { execFile } from "node:child_process";
 import { randomUUID } from "node:crypto";
 import { existsSync } from "node:fs";
-import { appendFile, mkdir, readFile } from "node:fs/promises";
+import { appendFile, mkdir, readdir, readFile, writeFile } from "node:fs/promises";
 import { homedir } from "node:os";
 import { join, resolve } from "node:path";
 import { promisify } from "node:util";
@@ -41,6 +41,99 @@ const LEDGER_CACHE_MS = 5_000;
 
 const roleSchema = z.enum(["mayor", "polecat", "reviewer", "buzzard", "imperator"]);
 type PatrolRole = "buzzard" | "imperator";
+
+type Forge = "github" | "gitlab" | "gitea" | null;
+type ForgeCli = "gh" | "glab" | "gt" | "tea" | null;
+
+/** A pull/merge request reference found in free text (e.g. a polecat report). */
+export interface PrRef {
+  url: string;
+  number: number;
+  forge: Forge;
+}
+
+/** Extract PR/MR URLs from free text. Matches github.com, gitlab (any host), gitea/forgejo/codeberg/codeberg\.org — any host, classified by host name. */
+export function parsePrUrls(text: string): PrRef[] {
+  const found = new Map<string, PrRef>();
+  const pattern = /(https?:\/\/[^\s<>()"']+?\/(?:pull|pulls|merge_requests)\/)(\d+)\b/gi;
+  for (const match of text.matchAll(pattern)) {
+    const url = (match[1] ?? "") + (match[2] ?? "");
+    const number = Number(match[2]);
+    if (!Number.isFinite(number)) continue;
+    const forge = forgeFromRemote(url);
+    if (!found.has(url)) found.set(url, { url, number, forge });
+  }
+  return [...found.values()];
+}
+
+/** Interpret a forge CLI's answer about a PR/MR state. Conservative: null when unsure. */
+export function parseForgePrState(output: string): "merged" | "closed" | "open" | null {
+  const jsonState = /"state"\s*:\s*"([a-z_]+)"/i.exec(output);
+  const state = (jsonState?.[1] ?? (/\b(merged|closed|opened|open|declined|canceled|cancelled)\b/i.exec(output)?.[1] ?? "")).toLowerCase();
+  if (!state) return null;
+  if (state === "merged") return "merged";
+  if (state === "open" || state === "opened") return "open";
+  if (["closed", "declined", "canceled", "cancelled"].includes(state)) return "closed";
+  return null;
+}
+
+/** Pure remote→forge mapping (exported for tests). Matches on the host, never the path. */
+export function forgeFromRemote(remoteUrl: string | null): Forge {
+  if (!remoteUrl) return null;
+  const url = remoteUrl.trim().toLowerCase();
+  if (!url) return null;
+  let host: string | null = null;
+  const schemeMatch = /^[a-z][a-z0-9+.-]*:\/\/(?:[^@/]+@)?([^/:]+)/.exec(url);
+  if (schemeMatch) {
+    host = schemeMatch[1] ?? null; // https://[user@]host[:port]/path (also ssh://, git://, file://)
+  } else {
+    const scpMatch = /^(?:[^@/]+@)?([^/:]+):/.exec(url); // git@host:org/repo.git
+    if (scpMatch) host = scpMatch[1] ?? null;
+  }
+  if (!host) return null;
+  if (host.includes("github")) return "github";
+  if (host.includes("gitlab")) return "gitlab";
+  if (host.includes("gitea") || host.includes("forgejo") || host.includes("codeberg")) return "gitea";
+  return null;
+}
+
+/** The name `gt` is ambiguous (gitea-cli, Graphite, ...). Only trust it as Gitea's CLI when it says so. */
+export function looksLikeGiteaCli(versionOutput: string): boolean {
+  return /gitea/i.test(versionOutput);
+}
+
+const FORGE_ALIASES: Record<string, string> = {
+  github: "gh",
+  gitlab: "glab",
+  gitea: "gt",
+  forgejo: "gt",
+  "gitea-cli": "gt",
+};
+
+const execProbe = (bin: string, args: string[]): Promise<string> =>
+  execFileAsync(bin, args, { timeout: 5_000 }).then((r) => r.stdout + r.stderr);
+
+/**
+ * Resolve the Gitea-family CLI: the official `gt` (gitea-cli, verified by its
+ * version banner), else the archived but still-working `tea`. Null when neither works.
+ */
+export async function detectGiteaCli(
+  probe: (bin: string, args: string[]) => Promise<string> = execProbe,
+): Promise<"gt" | "tea" | null> {
+  try {
+    const out = await probe("gt", ["--version"]);
+    if (looksLikeGiteaCli(out)) return "gt";
+    // `gt` exists but is some other tool (e.g. Graphite) — do not mistake it for Gitea's.
+  } catch {
+    /* gt not installed or not runnable */
+  }
+  try {
+    await probe("tea", ["--version"]);
+    return "tea";
+  } catch {
+    return null;
+  }
+}
 const stateSchema = z.enum([
   "starting",
   "pending",
@@ -82,6 +175,7 @@ export type ManagedThread = z.infer<typeof managedThreadSchema>;
 const rigSchema = z.object({
   projectId: z.string(),
   name: z.string(),
+  forge: z.string().nullable(),
   registeredAt: z.number(),
 });
 export type Rig = z.infer<typeof rigSchema>;
@@ -150,6 +244,7 @@ const convoyParams = z.object({
 const completeParams = z.object({
   threadId: z.string().trim().min(1),
   result: z.string().trim().max(MAX_RESULT_LENGTH).optional().describe("The verified outcome recorded on the bead."),
+  archive: z.boolean().optional().describe("Archive the thread after completing it so bb collects its worktree. Defaults to true. Pass false to keep it open."),
 });
 
 const adoptParams = z.object({
@@ -248,7 +343,10 @@ export const rpcContract = defineRpcContract({
     output: z.object({ threadId: z.string(), created: z.boolean() }).strict(),
   },
   rigAdd: {
-    input: z.object({ projectId: z.string().trim().min(1) }).strict(),
+    input: z.object({
+      projectId: z.string().trim().min(1),
+      forge: z.enum(["gh", "glab", "gt", "tea", "none"]).nullable().optional(),
+    }).strict(),
     output: rigSchema.strict(),
   },
   rigRemove: {
@@ -328,6 +426,7 @@ interface ManagedRow {
   active_since: number | null;
   active_cycle: number;
   stall_alerted_cycle: number | null;
+  review_requested_by: string | null;
   created_at: number;
   updated_at: number;
 }
@@ -335,6 +434,7 @@ interface ManagedRow {
 interface RigRow {
   project_id: string;
   name: string;
+  forge: string | null;
   registered_at: number;
 }
 
@@ -357,13 +457,15 @@ const BUILT_IN_RULES = `# Town operating rules
 - Escalation flows polecat → Mayor → owner. Resolve what you can from settled decisions; bring the owner only genuine product decisions, credentials, external accounts, and irreversible actions.
 - Absolute law: never commit to or merge a repo's main/default branch without the owner's explicit say-so.
 - Keep thread titles literal and recognizable. Never invent codenames.
-- Do not delete user threads. Mark work complete; let the owner archive it.`;
+- Do not delete user threads. town_complete closes the bead and archives the thread (once no reviewer is still running); the owner can always unarchive.`;
 
 /** Seeded into a brand-new town folder; never overwrites an existing file. */
 const STARTER_TOWN_MD = `# Town rules
 
-This file is the town's operating rules. The Mayor reads it at startup and
-refreshes it every patrol cycle; every polecat brief carries it. Edit freely.
+This file is the town's standing rules — every thread in this town reads it.
+The Mayor maintains it: add durable preferences and policies here as they
+come up (naming, review bar, commit style, release rituals, escalation
+norms). Keep it short; it is read on every spawn.
 
 - Keep thread titles literal and recognizable. Never invent codenames.
 - Escalation flows polecat → Mayor → owner. Bring the owner only genuine
@@ -373,7 +475,11 @@ refreshes it every patrol cycle; every polecat brief carries it. Edit freely.
 - Polecats work in their own worktrees; anything outside a worktree flows
   through the Mayor.
 
-(This starter was written by madmax when the town folder was created.)
+Town-local skills live in \`skills/<role>/<name>/SKILL.md\` — role being
+\`mayor\`, \`polecat\`, \`reviewer\`, \`buzzard\`, \`imperator\`, or \`shared\`
+(every role). SKILL.md carries \`name\` and \`description\` frontmatter. The
+matching skills are injected into a thread's brief at launch; the Mayor
+maintains these too.
 `;
 
 /** Absolute, ~-expanded — the plugin server may not share the caller's cwd. */
@@ -440,6 +546,11 @@ export default async function plugin(bb: BbPluginApi) {
       default: "accept-edits",
     },
     stallMinutes: { type: "string", label: "Stall threshold (minutes)", default: "30" },
+    mergeWatch: {
+      type: "boolean",
+      label: "Close out merged PRs automatically (bead closed, thread completed and archived once no reviewer is still running)",
+      default: true,
+    },
     rigsDir: {
       type: "string",
       label: "Rigs directory (empty = <town>/rigs)",
@@ -470,6 +581,7 @@ export default async function plugin(bb: BbPluginApi) {
       name TEXT NOT NULL,
       registered_at INTEGER NOT NULL
     )`,
+    `ALTER TABLE rigs ADD COLUMN forge TEXT`,
     `CREATE TABLE IF NOT EXISTS town_threads (
       thread_id TEXT PRIMARY KEY,
       role TEXT NOT NULL CHECK(role IN ('mayor','polecat','reviewer')),
@@ -537,6 +649,18 @@ export default async function plugin(bb: BbPluginApi) {
     `ALTER TABLE town_threads_v2 RENAME TO town_threads`,
     `CREATE INDEX IF NOT EXISTS town_threads_mayor ON town_threads (mayor_thread_id, created_at)`,
     `CREATE INDEX IF NOT EXISTS town_threads_project ON town_threads (project_id, created_at)`,
+    `ALTER TABLE town_threads ADD COLUMN review_requested_by TEXT`,
+    `CREATE TABLE IF NOT EXISTS pr_watch (
+      url TEXT PRIMARY KEY,
+      thread_id TEXT NOT NULL,
+      bead_id TEXT,
+      number INTEGER NOT NULL,
+      forge TEXT,
+      state TEXT NOT NULL DEFAULT 'open',
+      failures INTEGER NOT NULL DEFAULT 0,
+      last_checked INTEGER NOT NULL DEFAULT 0,
+      created_at INTEGER NOT NULL
+    )`,
   ]);
 
   const allRows = db.prepare(`SELECT * FROM town_threads ORDER BY created_at ASC`);
@@ -614,19 +738,21 @@ export default async function plugin(bb: BbPluginApi) {
     title: string;
     state?: ManagedRow["state"];
     status?: string | null;
+    reviewRequestedBy?: "mayor" | "polecat" | null;
   }) {
     const now = Date.now();
     db.prepare(`INSERT INTO town_threads (
       thread_id, role, project_id, mayor_thread_id, bead_id, tier, title,
-      state, status, active_since, active_cycle, created_at, updated_at
-    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+      state, status, active_since, active_cycle, created_at, updated_at, review_requested_by
+    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
     ON CONFLICT(thread_id) DO UPDATE SET role=excluded.role, project_id=excluded.project_id,
       mayor_thread_id=excluded.mayor_thread_id, bead_id=excluded.bead_id, tier=excluded.tier,
-      title=excluded.title, state=excluded.state, status=excluded.status, updated_at=excluded.updated_at`).run(
+      title=excluded.title, state=excluded.state, status=excluded.status, updated_at=excluded.updated_at,
+      review_requested_by=excluded.review_requested_by`).run(
       input.threadId, input.role, input.projectId, input.mayorThreadId ?? null,
       input.beadId ?? null, input.tier ?? null, input.title, input.state ?? "starting",
       input.status ?? "starting", input.state === "active" ? now : null,
-      input.state === "active" ? 1 : 0, now, now,
+      input.state === "active" ? 1 : 0, now, now, input.reviewRequestedBy ?? null,
     );
     reloadRoles();
     publishTown();
@@ -655,8 +781,9 @@ export default async function plugin(bb: BbPluginApi) {
   }
 
   async function readRules(projectId: string) {
-    const cached = rulesCache.get(projectId);
-    if (cached) return cached;
+    // Always re-read: town.md is the owner's (and the Mayor's) live steering
+    // file — edits must take effect without a plugin reload. The cache only
+    // feeds the synchronous agent-configuration path.
     try {
       const file = await bb.sdk.projects.fileContent({ projectId, path: RULES_FILE });
       const content = file.contentEncoding === "base64"
@@ -669,6 +796,86 @@ export default async function plugin(bb: BbPluginApi) {
       rulesCache.set(projectId, BUILT_IN_RULES);
       return BUILT_IN_RULES;
     }
+  }
+
+  interface TownSkill {
+    name: string;
+    description: string;
+    body: string;
+    path: string;
+  }
+
+  /**
+   * Town-local skills, scoped by role: <town>/skills/<role>/<name>/SKILL.md
+   * (plus <town>/skills/shared/<name>/SKILL.md for every role). SKILL.md carries
+   * name/description frontmatter, mirroring the common skill-file convention.
+   */
+  async function readTownSkills(townPath: string, roles: string[]): Promise<TownSkill[]> {
+    const groups = [...new Set([...roles, "shared"])];
+    const skills: TownSkill[] = [];
+    const seen = new Set<string>();
+    for (const group of groups) {
+      const groupDir = join(townPath, "skills", group);
+      let entries;
+      try {
+        entries = await readdir(groupDir, { withFileTypes: true });
+      } catch {
+        continue; // role has no skills directory — fine
+      }
+      for (const entry of entries) {
+        if (!entry.isDirectory() || seen.has(`${group}/${entry.name}`)) continue;
+        const skillFile = join(groupDir, entry.name, "SKILL.md");
+        try {
+          const raw = await readFile(skillFile, "utf8");
+          const front = /^---\r?\n([\s\S]*?)\r?\n---\r?\n?/.exec(raw);
+          const meta = front?.[1] ?? "";
+          const field = (key: string) =>
+            new RegExp(`^${key}:\\s*(.+)$`, "im").exec(meta)?.[1]?.trim().replace(/^["']|["']$/g, "") ?? "";
+          const body = front ? raw.slice(front[0].length).trim() : raw.trim();
+          skills.push({
+            name: clip(field("name") || entry.name, 80),
+            description: clip(field("description"), 240),
+            body: clip(body, 6_000),
+            path: skillFile,
+          });
+          seen.add(`${group}/${entry.name}`);
+        } catch {
+          // Ignore unreadable entries — a half-written skill must not break the spawn.
+        }
+      }
+      if (skills.length >= 40) break;
+    }
+    return skills;
+  }
+
+  /** Render the town-skills prompt section; full content inlined up to a budget. */
+  function renderTownSkills(skills: TownSkill[]): string[] {
+    if (skills.length === 0) return [];
+    const lines = [
+      "",
+      "## Town skills",
+      "This town ships its own skills (from its skills/ folder). Apply the ones that fit the task; do not wait to be told.",
+    ];
+    let budget = 12_000;
+    for (const skill of skills) {
+      const block = `${lines.length === 3 ? "" : ""}\n### ${skill.name}${skill.description ? ` — ${skill.description}` : ""}\n${skill.body}\n`;
+      if (block.length <= budget) {
+        lines.push(block);
+        budget -= block.length;
+      } else {
+        lines.push(`\n- ${skill.name} — ${skill.description} (read ${skill.path} when it applies)`);
+      }
+    }
+    return lines;
+  }
+
+  /** Town skills available to a role, rendered for a spawn prompt (empty when none). */
+  async function townSkillsSection(roles: string[], projectId?: string): Promise<string[]> {
+    const townId = projectId ?? (await configuredTownProject());
+    if (!townId) return [];
+    const source = await townSource(townId);
+    if (!source) return [];
+    return renderTownSkills(await readTownSkills(source.path, roles));
   }
 
   async function projectName(projectId: string) {
@@ -769,6 +976,130 @@ export default async function plugin(bb: BbPluginApi) {
     } catch {
       return null;
     }
+  }
+
+  /** Infer a rig's forge from its origin remote; null when unrecognizable. */
+  async function inferForgeFromRemote(projectId: string): Promise<ForgeCli> {
+    const path = await projectSourcePath(projectId);
+    if (!path) return null;
+    try {
+      const remote = (await execFileAsync("git", ["-C", path, "remote", "get-url", "origin"], { timeout: 10_000 })).stdout.trim();
+      const family = forgeFromRemote(remote);
+      if (family === "github") return "gh";
+      if (family === "gitlab") return "glab";
+      if (family === "gitea") return detectGiteaCli();
+      return null;
+    } catch {
+      return null;
+    }
+  }
+
+  /** Resolve the forge + CLI for a project (its rig, if registered): an explicit
+   * rig pin wins, then a per-run inference from the rig's origin remote, else
+   * nothing — never a guess. Only `gt` pins are verified at resolve time: `gt`
+   * is ambiguous (Graphite uses the same binary name), so a gt pin only holds
+   * when the binary proves it is gitea-cli. Explicit gh/glab/tea pins are taken
+   * at face value — those binary names are unambiguous. */
+  async function resolveForge(projectId: string): Promise<{ forge: Forge; cli: ForgeCli }> {
+    const rig = rigById.get(projectId) as RigRow | undefined;
+    const pinned = rig?.forge ?? null;
+    const installed = async (bin: string) =>
+      execFileAsync(bin, ["--version"], { timeout: 5_000 }).then(() => true, () => false);
+    if (pinned === "none") return { forge: null, cli: null };
+    if (pinned === "gh") return { forge: "github", cli: "gh" };
+    if (pinned === "glab") return { forge: "gitlab", cli: "glab" };
+    if (pinned === "tea") return { forge: "gitea", cli: "tea" };
+    if (pinned === "gt") return { forge: "gitea", cli: (await detectGiteaCli()) === "gt" ? "gt" : null };
+    const detected = await inferForgeFromRemote(projectId);
+    if (detected === "gh") return { forge: "github", cli: (await installed("gh")) ? "gh" : null };
+    if (detected === "glab") return { forge: "gitlab", cli: (await installed("glab")) ? "glab" : null };
+    if (detected === "gt" || detected === "tea") return { forge: "gitea", cli: detected };
+    return { forge: null, cli: null };
+  }
+
+  async function projectSourcePath(projectId: string): Promise<string | null> {
+    try {
+      const project = await bb.sdk.projects.get({ projectId });
+      const source = project.sources?.find((candidate) => candidate.isDefault) ?? project.sources?.[0];
+      return source?.path ?? null;
+    } catch {
+      return null;
+    }
+  }
+
+  /** Forge lines for a brief: which CLI to use, or explicit degraded-mode instructions. */
+  function forgeLines(forge: Forge, cli: ForgeCli): string[] {
+    const expectedCli = forge === "github" ? "gh" : forge === "gitlab" ? "glab" : "gt";
+    if (!cli) {
+      if (forge === null) {
+        return [
+          "No forge CLI (gh/glab/gt/tea) is available on the BB host.",
+          "Use plain git for everything. Do not run gh, glab, gt, or tea commands.",
+          "Fetch the change with git fetch and inspect it with git log/diff. Do not post anything anywhere.",
+        ];
+      }
+      const name = forge === "github" ? "GitHub" : forge === "gitlab" ? "GitLab" : "Gitea/Forgejo";
+      return [
+        `${name} was detected from the remote, but its CLI is not installed or not usable (expected: ${expectedCli}${forge === "gitea" ? " or tea" : ""}).`,
+        "Use plain git for reading (git fetch, git log, git diff). Do not post anything anywhere.",
+      ];
+    }
+    if (cli === "gh") {
+      return [
+        "Forge: GitHub — use the gh CLI (`gh pr --help`, `gh issue --help` for syntax).",
+      ];
+    }
+    if (cli === "glab") {
+      return [
+        "Forge: GitLab — use the glab CLI. A pull request here is a merge request: glab mr view/create/checkout/diff (`glab mr --help`). Issues: glab issue view.",
+      ];
+    }
+    if (cli === "gt") {
+      return [
+        "Forge: Gitea/Forgejo — use the gt CLI, the official Gitea CLI (`gt --help`; pull requests are `gt pr …`, e.g. gt pr view, gt pr checkout).",
+      ];
+    }
+    return [
+      "Forge: Gitea/Forgejo — use the tea CLI (legacy; succeeded by gt, the official gitea-cli). `tea --help`; pull requests are `tea pr …`.",
+    ];
+  }
+
+  /** Concrete PR/MR review commands per forge. */
+  function prCommands(forge: Forge, cli: ForgeCli, prNumber: number): string[] {
+    if (cli === "gh") {
+      return [
+        `1. Run: gh pr view ${prNumber} --json title,body,additions,deletions,files,headRefName`,
+        `2. Run: gh pr checkout ${prNumber}`,
+        `3. Read the diff: gh pr diff ${prNumber}`,
+      ];
+    }
+    if (cli === "glab") {
+      return [
+        `1. Run: glab mr view ${prNumber}`,
+        `2. Run: glab mr checkout ${prNumber}`,
+        `3. Read the diff: glab mr diff ${prNumber}`,
+      ];
+    }
+    if (cli === "gt") {
+      return [
+        `1. Run: gt pr view ${prNumber}`,
+        `2. Run: gt pr checkout ${prNumber}`,
+        `3. Read the diff: gt pr diff ${prNumber}`,
+      ];
+    }
+    if (cli === "tea") {
+      return [
+        `1. Run: tea pr view ${prNumber} (use --help for exact flags)`,
+        `2. Check it out: tea pr checkout ${prNumber}`,
+        `3. Read the diff: tea pr diff ${prNumber}`,
+      ];
+    }
+    const ref = forge === "gitlab" ? `refs/merge-requests/${prNumber}/head` : `refs/pull/${prNumber}/head`;
+    return [
+      `1. Fetch the change: git fetch origin ${ref}`,
+      `2. Create a local branch: git checkout -b review-pr-${prNumber} FETCH_HEAD`,
+      "3. Read the diff with git diff against the default branch",
+    ];
   }
 
   /** The town checkout path, from the town project's default local source. */
@@ -938,16 +1269,25 @@ export default async function plugin(bb: BbPluginApi) {
     const name = await projectName(target);
     const rules = await readRules(target);
     const title = `Mayor · ${name}`;
+    const source = await townSource(target);
+    const townPath = source?.path ?? null;
+    const mayorSkillLines = await townSkillsSection(["mayor"], target);
     const prompt = [
       `You are the Mayor of ${name} — the town's chief-of-staff agent. You coordinate work across the town's registered rig projects through visible polecat threads.`,
       "",
       "You run directly in the town checkout, not a worktree. The owner sees the same files you do. bd run from your shell reads the town ledger.",
       "",
+      townPath
+        ? `This town lives at ${townPath}. It holds the bead ledger (.beads/), town.md (the town's standing rules), and the rigs/ checkouts — the owner sees the same files, so make surgical changes and commit them like normal files.`
+        : "The town checkout path is unknown to this spawn; ask the owner where the town folder lives.",
+      "town.md in the town root is this town's living rules file — every thread in the town reads it. When the owner gives a standing preference or policy (naming, review bar, commit style, release ritual, escalation norms), record it in town.md yourself. For a repeatable capability, add a town-local skill at skills/<role>/<name>/SKILL.md (frontmatter: name, description; role is mayor, polecat, reviewer, buzzard, imperator, or shared for everyone) and point at it from town.md. Keep both short; agents read them at launch.",
+      ...mayorSkillLines,
+      "",
       "Use town_sling to start one polecat per self-contained work item; choose the model tier honestly (simplest for trivial mechanical work, small for lookups and single-file changes, medium for multi-file features, difficult for tricky logic, mostDifficult for adversarial or security-sensitive work).",
-      "When the owner names a repository the town doesn't know, create the rig yourself with town_create_rig (give it the git URL); read GitHub issues with gh in your shell.",
-      "Use town_roster for the town's threads. Before deciding, use town_inspect to read a thread's live status, persisted report, and last assistant output. Reports are evidence, not proof — verify with town_verify and commission independent reviews with town_review.",
+      "When the owner names a repository the town doesn't know, create the rig yourself with town_create_rig (give it the git URL). The town works with GitHub, GitLab, and Gitea/Forgejo: a rig's forge is inferred from its remote URL (github.com, gitlab.com, codeberg.org, forgejo/gitea hosts). If the host does not identify the forge — for example a homelab server such as https://git.home — do not guess: ask the owner which forge it is and record the answer with town_set_rig_forge. Do the same whenever a forge command fails with a CLI error that looks like a mis-detection.",
+      "Use town_roster for the town's threads. Before deciding, use town_inspect to read a thread's live status, persisted report, and last assistant output. Reports are evidence, not proof — verify with town_verify.",
       "Use town_nudge to answer a polecat's question or correct course; steer only a thread working something wrong right now.",
-      "Polecats report ready or blocked; only you decide when work is verified. Review adversarially before landing (town_review, lite or full, with a persona and criteria the owner names). Land verified work with town_land (branch pushed, bead to review) and mark it complete with town_complete. To review someone else's pull request, use town_pr_review — it mints the bead and the reviewer threads; you compile findings and draft the PR response, and the owner decides posting. Escalate to the owner only genuine product decisions, credentials, external accounts, and irreversible actions — lead with a recommendation and the evidence.",
+      "Polecats report ready or blocked; only you decide when work is verified. Polecats request their own adversarial review in their worktree and fix the findings before reporting ready — review is part of their loop, not a gate you run. town_review stays yours for owner-commissioned deep dives (a persona and criteria you name). Verify with town_verify before landing, land verified work with town_land (branch pushed, bead to review), and mark it complete with town_complete (it closes the bead and archives the thread once no reviewer is still running). The town watches pull requests your polecats open: when one merges, the bead closes and the thread is completed and archived automatically — no action needed from you. To review someone else's pull request, use town_pr_review — it mints the bead and the reviewer threads; you compile findings and draft the PR response, and the owner decides posting. Escalate to the owner only genuine product decisions, credentials, external accounts, and irreversible actions — lead with a recommendation and the evidence.",
       "",
       "You are the owner's main interface, so this thread stays responsive. Never run long-blocking commands here — no watching CI (gh run watch), no long builds, no long test suites, no waiting on anything slow. Hand long waits to a polecat as a brief and end your turn; its report wakes you.",
       "", "## Town rules", rules,
@@ -957,7 +1297,6 @@ export default async function plugin(bb: BbPluginApi) {
     // the owner and the Mayor see the same files and `bd` finds the town
     // ledger from the Mayor's shell, whatever the owner's default
     // new-thread environment is.
-    const source = await townSource(target);
     if (!source) {
       bb.log.warn("Town project has no local source; the Mayor runs on the project's default environment instead of the town checkout.");
     }
@@ -1052,6 +1391,34 @@ export default async function plugin(bb: BbPluginApi) {
         content: STARTER_TOWN_MD,
         contentEncoding: "utf8",
       });
+      try {
+        if (!existsSync(join(path, "skills"))) {
+          await mkdir(join(path, "skills"), { recursive: true });
+          await writeFile(
+            join(path, "skills", "README.md"),
+            [
+              "# Town skills",
+              "",
+              "One directory per skill, grouped by role:",
+              "",
+              "    skills/mayor/<name>/SKILL.md      # Mayor only",
+              "    skills/polecat/<name>/SKILL.md    # polecats only",
+              "    skills/reviewer/<name>/SKILL.md   # reviewers only",
+              "    skills/buzzard/<name>/SKILL.md    # Buzzard patrols only",
+              "    skills/imperator/<name>/SKILL.md  # Imperator patrols only",
+              "    skills/shared/<name>/SKILL.md     # every role",
+              "",
+              "Each SKILL.md carries `name:` and `description:` frontmatter.",
+              "Matching skills are injected into a thread's brief at launch;",
+              "the Mayor maintains these files. Keep them short.",
+              "",
+            ].join("\n"),
+            "utf8",
+          );
+        }
+      } catch (error) {
+        bb.log.warn(`Town skills directory could not be seeded: ${String(error)}`);
+      }
     }
     // A town wants version control and a ledger. Both are best-effort:
     // a town without git or bd still works for brief-only slings, and the
@@ -1083,16 +1450,23 @@ export default async function plugin(bb: BbPluginApi) {
     return rigById.get(projectId) !== undefined;
   }
 
-  async function addRig(projectId: string): Promise<Rig> {
+  async function addRig(projectId: string, forge?: string | null): Promise<Rig> {
     const existing = rigById.get(projectId) as RigRow | undefined;
-    if (existing) return { projectId: existing.project_id, name: existing.name, registeredAt: existing.registered_at };
+    if (existing) {
+      if (forge !== undefined && forge !== existing.forge) {
+        db.prepare(`UPDATE rigs SET forge=? WHERE project_id=?`).run(forge, projectId);
+        publishTown();
+        return { projectId: existing.project_id, name: existing.name, forge, registeredAt: existing.registered_at };
+      }
+      return { projectId: existing.project_id, name: existing.name, forge: existing.forge ?? null, registeredAt: existing.registered_at };
+    }
     const name = await projectName(projectId);
+    const resolvedForge = forge !== undefined ? forge : await inferForgeFromRemote(projectId);
     const now = Date.now();
-    db.prepare(`INSERT INTO rigs (project_id, name, registered_at) VALUES (?, ?, ?)
-      ON CONFLICT(project_id) DO UPDATE SET name=excluded.name`).run(projectId, name, now);
-    logEvent("rig", `Rig registered: ${name} (${projectId})`);
+    db.prepare(`INSERT INTO rigs (project_id, name, forge, registered_at) VALUES (?, ?, ?, ?)`).run(projectId, name, resolvedForge ?? null, now);
+    logEvent("rig", `Rig registered: ${name} (${projectId})${resolvedForge ? ` · forge ${resolvedForge}` : ""}`);
     publishTown();
-    return { projectId, name, registeredAt: now };
+    return { projectId, name, forge: resolvedForge ?? null, registeredAt: now };
   }
 
   function removeRig(projectId: string) {
@@ -1199,6 +1573,7 @@ export default async function plugin(bb: BbPluginApi) {
       invalidateLedger();
     }
     const tier: Tier = params.tier ?? DEFAULT_TIER;
+    const forge = params.openPr ? await resolveForge(rigProjectId) : null;
     const sectionId = await ensureSection();
     const townName = await projectName(townId);
     const rigName = rigProjectId === townId ? `${townName} (town work)` : await projectName(rigProjectId);
@@ -1218,14 +1593,33 @@ export default async function plugin(bb: BbPluginApi) {
       "## Constraints",
       bullets(params.constraints),
       ...(params.context ? ["", "## Context", params.context] : []),
-      ...(params.openPr
+      ...(await townSkillsSection(["polecat"], townId)),
+      ...(params.openPr && forge
         ? [
             "",
             "## Pull request",
             "- The owner approved opening a pull request for this task.",
-            "- When your changes are done: commit your work on your branch, push the branch (git push -u origin HEAD), then create the pull request (gh pr create).",
-            "- Write the pull request title and description in plain engineering language. No internal vocabulary.",
-            "- Put the pull request URL in your final report.",
+            ...(forge.cli === "gh"
+              ? [
+                  "- When your changes are done: commit your work on your branch, push the branch (git push -u origin HEAD), then create the pull request: gh pr create.",
+                ]
+              : forge.cli === "glab"
+                ? [
+                    "- When your changes are done: commit your work on your branch, push the branch (git push -u origin HEAD), then create the merge request: glab mr create.",
+                  ]
+                : forge.cli === "gt"
+                  ? [
+                      "- When your changes are done: commit your work on your branch, push the branch (git push -u origin HEAD), then create the pull request: gt pr create.",
+                    ]
+                  : forge.cli === "tea"
+                  ? [
+                      "- When your changes are done: commit your work on your branch, push the branch (git push -u origin HEAD), then create the pull request: tea pr create (see tea --help for the exact flags).",
+                    ]
+                  : [
+                      "- No forge CLI (gh/glab/gt/tea) is available. Push your branch (git push -u origin HEAD) and report the branch name; the owner will open the request manually.",
+                    ]),
+            "- Write the pull/merge request title and description in plain engineering language. No internal vocabulary.",
+            "- Put the pull/merge request URL in your final report.",
           ]
         : []),
       "",
@@ -1240,9 +1634,15 @@ export default async function plugin(bb: BbPluginApi) {
       "- Anything outside your worktree goes to the Mayor. Report it. Do not do it.",
       "- Check your work yourself. Run the closest real check. A typecheck alone is not enough.",
       "",
+      "## Review",
+      "- When your work is done and checked, request an adversarial review of your own work with polecat_request_review (lite unless told otherwise).",
+      "- The reviewer works in your worktree. Their findings arrive in this thread. Fix what they find, commit, and request a fresh review.",
+      "- Repeat until a verdict is ship. Do not report ready while a review finding is unaddressed.",
+      "- If the reviewer and you disagree, report the disagreement to the Mayor instead of looping forever — state both sides and let the Mayor decide.",
+      "",
       "## Report",
       "- Use polecat_report. Use state ready when the work is done. Use state blocked when you cannot continue.",
-      "- A ready report states: what you changed, which files, which checks you ran, what remains.",
+      "- A ready report states: what you changed, which files, which checks you ran, what remains — and the review verdict.",
       "- A blocked report states: the blocker, and your recommended next step.",
       "- You talk to the Mayor. Do not talk to the owner.",
       "- Run the task without waiting for more instructions.",
@@ -1304,9 +1704,9 @@ export default async function plugin(bb: BbPluginApi) {
     return roles.get(threadId)!;
   }
 
-  function enqueueAlert(row: ManagedRow, key: string, message: string) {
-    const target = row.role === "mayor" ? row.thread_id : row.mayor_thread_id;
-    if (!target) throw new Error(`Managed thread ${row.thread_id} has no Mayor to notify.`);
+  function enqueueAlert(row: ManagedRow, key: string, message: string, targetOverride?: string) {
+    const target = targetOverride ?? (row.role === "mayor" ? row.thread_id : row.mayor_thread_id);
+    if (!target) throw new Error(`Managed thread ${row.thread_id} has no recipient for its notification.`);
     db.prepare(`INSERT OR IGNORE INTO alert_outbox
       (dedupe_key, target_thread_id, source_thread_id, message, created_at)
       VALUES (?, ?, ?, ?, ?)`).run(
@@ -1345,8 +1745,8 @@ export default async function plugin(bb: BbPluginApi) {
     }
   }
 
-  async function alertMayor(row: ManagedRow, key: string, message: string) {
-    const outboxKey = enqueueAlert(row, key, message);
+  async function alertMayor(row: ManagedRow, key: string, message: string, targetOverride?: string) {
+    const outboxKey = enqueueAlert(row, key, message, targetOverride);
     return deliverAlert(outboxKey);
   }
 
@@ -1368,17 +1768,36 @@ export default async function plugin(bb: BbPluginApi) {
     reloadRoles();
     publishTown();
     const current = roles.get(threadId)!;
-    const summary = [
-      `${row.role === "reviewer" ? "Reviewer" : "Polecat"} report from ${row.title} (${threadId})`,
-      `State: ${params.state}`,
-      ...(params.result ? [`Result: ${params.result}`] : []),
-      ...(params.state === "blocked" ? [`Blocker: ${params.blocker}`] : []),
-      ...(params.recommendation ? [`Recommendation: ${params.recommendation}`] : []),
-      "Inspect live evidence with town_inspect and choose: nudge, verify, complete, or escalate to the owner.",
-    ].join("\n");
-    const delivered = await alertMayor(current, `report:${now}:${randomUUID()}`, summary);
+    // A review commissioned by a polecat reports to that polecat, not the Mayor.
+    const reviewToWorker =
+      row.role === "reviewer" && row.review_requested_by === "polecat" && row.worker_thread_id;
+    const summary = reviewToWorker
+      ? [
+          `Reviewer report (${row.title})`,
+          `State: ${params.state}`,
+          ...(params.result ? [`Findings:\n${params.result}`] : []),
+          ...(params.state === "blocked" && params.blocker ? [`Blocker: ${params.blocker}`] : []),
+          ...(params.recommendation ? [`Verdict: ${params.recommendation}`] : []),
+          "Address the findings (fix, commit), then request a fresh review with polecat_request_review. When a verdict is ship, call polecat_report with state ready and include the verdict.",
+        ].join("\n")
+      : [
+          `${row.role === "reviewer" ? "Reviewer" : "Polecat"} report from ${row.title} (${threadId})`,
+          `State: ${params.state}`,
+          ...(params.result ? [`Result: ${params.result}`] : []),
+          ...(params.state === "blocked" ? [`Blocker: ${params.blocker}`] : []),
+          ...(params.recommendation ? [`Recommendation: ${params.recommendation}`] : []),
+          "Inspect live evidence with town_inspect and choose: nudge, verify, complete, or escalate to the owner.",
+        ].join("\n");
+    const delivered = await alertMayor(
+      current,
+      `report:${now}:${randomUUID()}`,
+      summary,
+      reviewToWorker ? row.worker_thread_id! : undefined,
+    );
     if (!delivered) {
-      throw new Error("Report was saved but could not be delivered to the Mayor. It will retry automatically; check Mayor connectivity before reporting again.");
+      throw new Error(reviewToWorker
+        ? "Report was saved but could not be delivered to the requesting polecat. It will retry automatically."
+        : "Report was saved but could not be delivered to the Mayor. It will retry automatically; check Mayor connectivity before reporting again.");
     }
     logEvent(
       "report",
@@ -1386,6 +1805,19 @@ export default async function plugin(bb: BbPluginApi) {
       threadId,
       current.bead_id,
     );
+    // Track any PRs the report mentions so a merge can be detected and close things out.
+    try {
+      const haystack = [params.result, params.recommendation, params.blocker].filter(Boolean).join("\n");
+      for (const pr of parsePrUrls(haystack)) {
+        // gitea-family: which binary (gt vs tea) is only known at poll time.
+        const cli = pr.forge === "github" ? "gh" : pr.forge === "gitlab" ? "glab" : null;
+        db.prepare(`INSERT OR IGNORE INTO pr_watch (url, thread_id, bead_id, number, forge, state, created_at)
+          VALUES (?, ?, ?, ?, ?, 'open', ?)`)
+          .run(pr.url, row.thread_id, current.bead_id, pr.number, cli, Date.now());
+      }
+    } catch (error) {
+      bb.log.warn(`Could not record PR watch entries for ${threadId}: ${String(error)}`);
+    }
     // NDI: the ledger is the durable record — reports land on the bead.
     if (current.bead_id) {
       try {
@@ -1429,7 +1861,7 @@ export default async function plugin(bb: BbPluginApi) {
   }
 
   /** Mayor-verified completion; closes the linked bead in the ledger. */
-  async function complete(threadId: string, result?: string) {
+  async function complete(threadId: string, result?: string, options: { archive?: boolean } = {}) {
     const row = roles.get(threadId);
     if (!row || row.role === "mayor") throw new Error(`No managed polecat or reviewer ${threadId}.`);
     const live = await bb.sdk.threads.get({ threadId });
@@ -1457,7 +1889,157 @@ export default async function plugin(bb: BbPluginApi) {
         bb.log.warn(note);
       }
     }
+    if (options.archive !== false) {
+      const pending = db.prepare(`SELECT COUNT(*) AS n FROM town_threads WHERE role='reviewer' AND worker_thread_id=? AND state NOT IN ('complete','archived','deleted','ready','blocked')`).get(threadId) as { n: number };
+      if (pending.n > 0) {
+        note += ` Thread left open: ${pending.n} reviewer(s) still running against it.`;
+      } else {
+        try {
+          await bb.sdk.threads.archive({ threadId });
+          note += " Thread archived.";
+        } catch (error) {
+          note += ` Thread could not be archived (${clip(String(error), 150)}); archive it from the thread menu.`;
+          bb.log.warn(`Could not archive ${threadId}: ${String(error)}`);
+        }
+      }
+    }
     return { threadId, title: current.title, beadId: current.bead_id, note };
+  }
+
+  interface PrWatchRow {
+    url: string;
+    thread_id: string;
+    bead_id: string | null;
+    number: number;
+    forge: string | null;
+    state: string;
+    failures: number;
+    last_checked: number;
+    created_at: number;
+  }
+
+  async function queryPrState(forge: string, row: { number: number; url: string }, cwd: string | undefined): Promise<"merged" | "closed" | "open" | null> {
+    const cwdOpt = cwd ? { cwd } : {};
+    let args: { bin: string; args: string[] };
+    if (forge === "gh" || forge === "gt") {
+      // gh and gt both accept the full PR URL and gh-style --json/--jq, so no repo checkout is needed.
+      args = forge === "gh"
+        ? { bin: "gh", args: ["pr", "view", row.url, "--json", "state", "--jq", ".state"] }
+        : { bin: "gt", args: ["pr", "view", row.url, "--json", "state", "--jq", ".state"] };
+    } else if (forge === "glab") {
+      // glab needs repo context; only callable with a worktree path.
+      if (!cwd) return null;
+      args = { bin: "glab", args: ["mr", "view", String(row.number), "--output", "json"] };
+    } else {
+      if (!cwd) return null;
+      args = { bin: "tea", args: ["pr", "view", String(row.number), "--output", "json"] };
+    }
+    // gh prints MERGED/CLOSED/OPEN; gt a lowercase state; glab/tea print JSON like {"state":"merged"}.
+    const { stdout } = await execFileAsync(args.bin, args.args, { ...cwdOpt, timeout: 15_000 });
+    return parseForgePrState(stdout);
+  }
+
+  let lastPrWatchAt = 0;
+
+  /** Detect merged/closed PRs for tracked threads and close them out. */
+  async function pollPrWatch() {
+    const settingsNow = await settings.get();
+    if (settingsNow.mergeWatch === false) return;
+    const now = Date.now();
+    if (now - lastPrWatchAt < 5 * 60_000) return;
+    lastPrWatchAt = now;
+    const rows = db.prepare(
+      `SELECT * FROM pr_watch WHERE state = 'open' AND last_checked < ? ORDER BY last_checked ASC LIMIT 10`,
+    ).all(now - 60_000) as PrWatchRow[];
+    for (const row of rows) {
+      try {
+        let forge = row.forge;
+        const threadRow = roles.get(row.thread_id);
+        if (!forge && threadRow) {
+          const pin = (rigById.get(threadRow.project_id) as RigRow | undefined)?.forge;
+          forge = (pin === "gh" || pin === "glab" || pin === "gt" || pin === "tea") ? pin : await inferForgeFromRemote(threadRow.project_id);
+        }
+        if (!forge) {
+          // Forge unknown for this rig (unpinned, unrecognized remote) — try again later.
+          db.prepare(`UPDATE pr_watch SET last_checked=? WHERE url=?`).run(now, row.url);
+          continue;
+        }
+        // The worktree may be gone (archived thread); gh can still answer from the URL alone.
+        let cwd: string | undefined;
+        try {
+          ({ path: cwd } = await threadWorktree(row.thread_id));
+        } catch {
+          cwd = undefined;
+        }
+        if (!cwd && forge !== "gh" && forge !== "gt") {
+          db.prepare(`UPDATE pr_watch SET last_checked=? WHERE url=?`).run(now, row.url);
+          continue;
+        }
+        const state = await queryPrState(forge, row, cwd);
+        if (state === "merged") {
+          // Close out quietly if the thread was already completed/archived by hand.
+          const alreadyClosed = !threadRow || ["complete", "archived", "deleted"].includes(threadRow.state);
+          let closeOutNote = "";
+          if (threadRow && !alreadyClosed) {
+            const result = await complete(row.thread_id, `Pull request merged: ${row.url}`);
+            closeOutNote = result.note.trim();
+          }
+          db.prepare(`UPDATE pr_watch SET state='merged', forge=COALESCE(forge, ?), last_checked=? WHERE url=?`)
+            .run(forge, now, row.url);
+          logEvent("pr-watch", `PR merged: ${row.url}`, row.thread_id, row.bead_id);
+          if (threadRow) {
+            await alertMayor(threadRow, `pr-merged:${row.url}`, [
+              `${row.url} merged.`,
+              alreadyClosed
+                ? "The work was already closed out — nothing left to do."
+                : `Bead ${row.bead_id ?? "(none)"} closed in the ledger.${closeOutNote ? ` ${closeOutNote}` : ""}`,
+            ].join("\n")).catch((error) => bb.log.warn(`Could not notify Mayor about ${row.url}: ${String(error)}`));
+          }
+          continue;
+        }
+        if (state === "closed") {
+          db.prepare(`UPDATE pr_watch SET state='closed', forge=COALESCE(forge, ?), last_checked=? WHERE url=?`)
+            .run(forge, now, row.url);
+          logEvent("pr-watch", `PR closed without merging: ${row.url}`, row.thread_id, row.bead_id);
+          if (threadRow) {
+            await alertMayor(threadRow, `pr-closed:${row.url}`,
+              `${row.url} was closed without merging. Bead ${row.bead_id ?? "(none)"} stays open — reopen the PR, rework it, or close the bead deliberately.`,
+            ).catch((error) => bb.log.warn(`Could not notify Mayor about ${row.url}: ${String(error)}`));
+          }
+          continue;
+        }
+        if (state === "open") {
+          db.prepare(`UPDATE pr_watch SET failures=0, last_checked=?, forge=COALESCE(forge, ?) WHERE url=?`).run(now, forge, row.url);
+          continue;
+        }
+        // Unparseable answer — bounded tolerance, then stop and say so.
+        const failures = row.failures + 1;
+        if (failures >= 8) {
+          db.prepare(`UPDATE pr_watch SET state='error', failures=?, last_checked=? WHERE url=?`).run(failures, now, row.url);
+          if (threadRow) {
+            await alertMayor(threadRow, `pr-watch-error:${row.url}`,
+              `I could not determine the state of ${row.url} after ${failures} checks (forge CLI answered but the output did not parse). Giving up on watching it — please look manually.`,
+            ).catch(() => undefined);
+          }
+        } else {
+          db.prepare(`UPDATE pr_watch SET failures=?, last_checked=? WHERE url=?`).run(failures, now, row.url);
+        }
+      } catch (error) {
+        const failures = row.failures + 1;
+        const terminal = failures >= 8;
+        db.prepare(`UPDATE pr_watch SET failures=?, last_checked=?, state=? WHERE url=?`)
+          .run(failures, now, terminal ? "error" : "open", row.url);
+        bb.log.warn(`PR watch failed for ${row.url}: ${String(error)}`);
+        if (terminal) {
+          const threadRow = roles.get(row.thread_id);
+          if (threadRow) {
+            await alertMayor(threadRow, `pr-watch-error:${row.url}`,
+              `Watching ${row.url} failed ${failures} times (last error: ${clip(String(error), 200)}). Stopping; please check the PR manually.`,
+            ).catch(() => undefined);
+          }
+        }
+      }
+    }
   }
 
   // ── The refinery: verify, review, land ──────────────────────────────
@@ -1592,12 +2174,14 @@ export default async function plugin(bb: BbPluginApi) {
     spec: ReviewSpec;
     subject: string;
     preamble: string[];
+    extra?: string[];
   }): string {
     const lines = [
       `Persona: ${input.spec.persona}.`,
       `Your lens: ${input.lens}. Judge only through this lens.`,
       ...(input.spec.focus ? [`Review focus: ${input.spec.focus}`] : []),
       ...input.preamble,
+      ...(input.extra ?? []),
       "",
       "Work in phases. Do them in order.",
       "",
@@ -1627,18 +2211,21 @@ export default async function plugin(bb: BbPluginApi) {
     return lines.join("\n");
   }
 
-  /** Commission independent reviews of an idle polecat's work (lite or full). */
-  async function startReview(threadId: string, specInput: ReviewSpec) {
+  /** Commission independent reviews of a polecat's work (lite or full). */
+  async function startReview(threadId: string, specInput: ReviewSpec, requestedBy: "mayor" | "polecat" = "mayor") {
     const worker = roles.get(threadId);
     if (!worker || worker.role !== "polecat") throw new Error(`No managed polecat ${threadId}.`);
+    // A reviewer that already reported (ready/blocked) no longer blocks a fresh review.
     const existing = db
-      .prepare(`SELECT * FROM town_threads WHERE role='reviewer' AND worker_thread_id=? AND state NOT IN ('complete','archived','deleted')`)
+      .prepare(`SELECT * FROM town_threads WHERE role='reviewer' AND worker_thread_id=? AND state NOT IN ('complete','archived','deleted','ready','blocked')`)
       .all(threadId) as ManagedRow[];
     if (existing.length > 0) {
       return { beadId: worker.bead_id, reviewers: existing.map((row) => ({ threadId: row.thread_id, title: row.title })), created: false };
     }
     const live = await bb.sdk.threads.get({ threadId });
-    if (BUSY_STATUSES.has(live.status)) {
+    // A polecat requesting review of its own work is mid-turn by definition; the
+    // idle gate only guards Mayor-commissioned reviews.
+    if (requestedBy !== "polecat" && BUSY_STATUSES.has(live.status)) {
       throw new Error(`Polecat ${threadId} is ${live.status}; wait until it is idle before starting a review.`);
     }
     if (live.deletedAt !== null || live.archivedAt !== null) throw new Error(`Polecat ${threadId} is not reviewable.`);
@@ -1646,6 +2233,7 @@ export default async function plugin(bb: BbPluginApi) {
     const values = await settings.get();
     const sectionId = await ensureSection();
 
+    const reviewerSkills = await townSkillsSection(["reviewer"]);
     const lenses = specInput.mode === "full" ? specInput.criteria : [specInput.criteria.join(", ")];
     const reviewers: { threadId: string; title: string }[] = [];
     for (const lens of lenses) {
@@ -1655,9 +2243,13 @@ export default async function plugin(bb: BbPluginApi) {
         lens,
         spec: specInput,
         subject: worker.title,
+        extra: reviewerSkills,
         preamble: [
           `You review the work of another agent. The work is in this worktree.`,
           `Work under review: “${worker.title}” by thread ${threadId}.`,
+          ...(requestedBy === "polecat"
+            ? ["The worker who produced this work requested the review and will act on your findings. Aim your findings at them: state fixes concretely, in file/line terms."]
+            : []),
         ],
       });
       const thread = await bb.sdk.threads.spawn({
@@ -1666,7 +2258,7 @@ export default async function plugin(bb: BbPluginApi) {
         sectionId,
         visibility: "visible",
         title,
-        parentThreadId: worker.mayor_thread_id ?? undefined,
+        parentThreadId: requestedBy === "polecat" ? threadId : worker.mayor_thread_id ?? undefined,
         parentNotifications: "stuck",
         pluginMetadata: { role: "reviewer", beadId: worker.bead_id, rig: worker.project_id },
         ...(values.reviewerProvider ? { providerId: values.reviewerProvider as string } : {}),
@@ -1678,6 +2270,7 @@ export default async function plugin(bb: BbPluginApi) {
         threadId: thread.id, role: "reviewer", projectId: worker.project_id,
         mayorThreadId: worker.mayor_thread_id, beadId: worker.bead_id,
         title, state: "starting", status: thread.status,
+        reviewRequestedBy: requestedBy,
       });
       db.prepare(`UPDATE town_threads SET worker_thread_id=? WHERE thread_id=?`).run(threadId, thread.id);
       reloadRoles();
@@ -1696,6 +2289,7 @@ export default async function plugin(bb: BbPluginApi) {
     const rigProjectId = target.projectId;
     const rigName = target.name;
     const prLabel = `${rigName}#${params.prNumber}`;
+    const forge = await resolveForge(rigProjectId);
     const beadId = (await runBd([
       "create",
       `Review PR #${params.prNumber} of ${rigName}`,
@@ -1714,6 +2308,7 @@ export default async function plugin(bb: BbPluginApi) {
     const sectionId = await ensureSection();
     const hostId = await defaultHostId();
 
+    const reviewerSkills = await townSkillsSection(["reviewer"]);
     const lenses = spec.mode === "full" ? spec.criteria : [spec.criteria.join(", ")];
     const reviewers: { threadId: string; title: string }[] = [];
     for (const lens of lenses) {
@@ -1723,14 +2318,14 @@ export default async function plugin(bb: BbPluginApi) {
         lens,
         spec,
         subject: title,
+        extra: reviewerSkills,
         preamble: [
           `You review a pull request of repository ${rigName}. Pull request: #${params.prNumber}.`,
+          ...forgeLines(forge.forge, forge.cli),
           "This is a review task. You do not write code for it.",
           "",
           "Do this first:",
-          `1. Run: gh pr view ${params.prNumber} --json title,body,additions,deletions,files,headRefName`,
-          `2. Run: gh pr checkout ${params.prNumber}`,
-          `3. Read every changed file. Use the diff: gh pr diff ${params.prNumber}`,
+          ...prCommands(forge.forge, forge.cli, params.prNumber),
         ],
       });
       const thread = await bb.sdk.threads.spawn({
@@ -1843,6 +2438,7 @@ export default async function plugin(bb: BbPluginApi) {
     await ensureLedger();
     const target = await resolveRigTarget(params);
     const prLabel = `${target.name}#${params.prNumber}`;
+    const forge = await resolveForge(target.projectId);
     const beadId = (await runBd([
       "create",
       `Maintain PR #${params.prNumber} of ${target.name}`,
@@ -1860,17 +2456,18 @@ export default async function plugin(bb: BbPluginApi) {
     const values = await settings.get();
     const sectionId = await ensureSection();
     const hostId = await defaultHostId();
+    const adoptSkills = await townSkillsSection(["polecat"]);
     const title = `PR maintain · ${prLabel}`;
     const prompt = [
       `You maintain a pull request. The town adopted it.`,
       `Repository: ${target.name}. Pull request: #${params.prNumber}.`,
+      ...adoptSkills,
       "",
       "Do this:",
-      `1. Run: gh pr view ${params.prNumber} --json title,body,state,statusCheckRollup,reviewDecision,headRefName`,
-      `2. Run: gh pr checkout ${params.prNumber}`,
-      "3. Read the review comments. Read the failed checks, if any.",
-      "4. Fix what is broken. Commit your fixes. Push to the pull request branch.",
-      `5. Check the state: gh pr checks ${params.prNumber}. Run it again after each push.`,
+      ...prCommands(forge.forge, forge.cli, params.prNumber),
+      "4. Read the review comments. Read the failed checks, if any.",
+      "5. Fix what is broken. Commit your fixes. Push to the pull request branch.",
+      "6. Check the state again after each push.",
       "",
       "Rules:",
       "- Push commits to the pull request branch when you fix something.",
@@ -1915,16 +2512,31 @@ export default async function plugin(bb: BbPluginApi) {
     return role === "buzzard" ? "buzzard" : "imperator";
   }
 
-  function buzzardBrief(rigName: string, includeUnmaintained: boolean): string {
+  function buzzardBrief(rigName: string, includeUnmaintained: boolean, forge: { forge: Forge; cli: ForgeCli }): string {
+    const prListCheck =
+      forge.cli === "gh"
+        ? "4. Abandoned pull requests. Check: gh pr list --state open --json number,title,isDraft,updatedAt. Flag drafts and stale PRs with no activity."
+        : forge.cli === "glab"
+          ? "4. Abandoned merge requests. Check: glab mr list --state opened. Flag draft MRs and stale ones with no activity."
+          : forge.cli === "gt"
+            ? "4. Abandoned pull requests. Check: gt pr list --state open. Flag drafts and stale PRs."
+            : forge.cli === "tea"
+            ? "4. Abandoned pull requests. Check: tea pr ls. Flag drafts and stale PRs."
+            : "4. Pull requests: no forge CLI detected — skip this check.";
+    const draftPrCmd = forge.cli === "gh" ? "gh pr create --draft" : forge.cli === "glab" ? "glab mr create --draft" : forge.cli === "gt" ? "gt pr create --draft" : "tea pr create --draft";
+    const draftPrLine = forge.cli
+      ? `- You may open ONE draft ${forge.cli === "glab" ? "merge request" : "pull request"} for safe removals (dead code, obvious comments, unused dependencies). Use: ${draftPrCmd}.`
+      : "- No forge CLI is available: do NOT open any pull or merge requests. Report the findings; the owner will open one if wanted.";
     return [
       `You are a Buzzard. You circle a repository and pick it clean.`,
       `Repository: ${rigName}. Work in your worktree.`,
+      ...forgeLines(forge.forge, forge.cli),
       "",
       "Look for:",
       "1. Pointless tests. Tests that assert nothing real.",
       "2. Obvious comments. Comments that only repeat the code next to them.",
       "3. Dead code. Code nothing calls. Old paths. Unused exports.",
-      "4. Abandoned pull requests. Check: gh pr list --state open --json number,title,isDraft,updatedAt. Flag drafts and stale PRs with no activity.",
+      prListCheck,
       "5. Unused dependencies. Use the project's own tooling when it has one (for example knip or depcheck for JavaScript, mix xref or unused for Elixir).",
       ...(includeUnmaintained
         ? [
@@ -1934,7 +2546,7 @@ export default async function plugin(bb: BbPluginApi) {
       "",
       "Rules:",
       "- Report every finding. Give the file, or the PR link.",
-      "- You may open ONE draft pull request for safe removals (dead code, obvious comments, unused dependencies). Use: gh pr create --draft.",
+      draftPrLine,
       "- The draft PR title and description must read like a normal cleanup PR. No internal vocabulary.",
       "- Never open a ready (non-draft) pull request. The Mayor decides when a draft goes ready.",
       "- Do not post comments or reviews on other people's pull requests.",
@@ -2010,6 +2622,7 @@ export default async function plugin(bb: BbPluginApi) {
       throw new Error("No Mayor thread is running; start the Mayor first (bb madmax start).");
     }
     const target = await resolveRigTarget(options);
+    const patrolForge = await resolveForge(target.projectId);
     if (patrolActive(role, target.projectId)) {
       return { skipped: true as const, projectId: target.projectId, name: target.name };
     }
@@ -2018,10 +2631,13 @@ export default async function plugin(bb: BbPluginApi) {
     const sectionId = await ensureSection();
     const hostId = await defaultHostId();
     const title = `${role === "buzzard" ? "Buzzard" : "Imperator"} · ${target.name}`;
-    const prompt =
+    const patrolSkills = await townSkillsSection([role]);
+    const prompt = [
       role === "buzzard"
-        ? buzzardBrief(target.name, options.includeUnmaintained ?? (values.buzzardUnmaintained as boolean))
-        : imperatorBrief(target.name);
+        ? buzzardBrief(target.name, options.includeUnmaintained ?? (values.buzzardUnmaintained as boolean), patrolForge)
+        : imperatorBrief(target.name),
+      ...patrolSkills,
+    ].join("\n");
     const thread = await bb.sdk.threads.spawn({
       projectId: target.projectId,
       environment: {
@@ -2222,6 +2838,7 @@ export default async function plugin(bb: BbPluginApi) {
       while (!signal.aborted) {
         try {
           await reconcile();
+          await pollPrWatch().catch((error) => bb.log.warn(`PR watch poll failed: ${String(error)}`));
           const values = await settings.get();
           const parsed = Number(values.stallMinutes);
           const threshold = (Number.isFinite(parsed) && parsed > 0 ? parsed : 30) * 60_000;
@@ -2312,7 +2929,7 @@ export default async function plugin(bb: BbPluginApi) {
       townProjectId: await configuredTownProject(),
       mayor: mayor ? toManaged(mayor) : null,
       threads: [...roles.values()].map(toManaged),
-      rigs: (allRigs.all() as RigRow[]).map((row) => ({ projectId: row.project_id, name: row.name, registeredAt: row.registered_at })),
+      rigs: (allRigs.all() as RigRow[]).map((row) => ({ projectId: row.project_id, name: row.name, forge: row.forge ?? null, registeredAt: row.registered_at })),
       ledger: await ledgerBlock(),
     };
   }
@@ -2380,7 +2997,7 @@ export default async function plugin(bb: BbPluginApi) {
   });
   bb.agents.registerTool({
     name: "town_review",
-    description: "Commission an adversarial review of an idle polecat's work, in its own worktree. Lite: one reviewer covers all criteria. Full: one reviewer per criterion. Reviewers report findings with confidence ratings; verified HIGH findings drive the fix loop.",
+    description: "Commission an owner-requested adversarial review of a polecat's work, in its own worktree. Polecats request their own reviews in their fix loop; use this only for an owner-commissioned deep dive. Lite: one reviewer covers all criteria. Full: one reviewer per criterion. Reviewers report to you; the polecat's own reviews report to the polecat.",
     parameters: reviewParams,
     async execute(params, context) {
       const caller = context.threadId ? roles.get(context.threadId) : undefined;
@@ -2452,7 +3069,36 @@ export default async function plugin(bb: BbPluginApi) {
       return [
         `Rig “${result.name}” is ready (${result.projectId}), cloned to ${result.path}.`,
         `Sling into it with town_sling rigProjectId=${result.projectId} (or tag beads with the label “${result.name}”).`,
+        `Forge: ${(await inferForgeFromRemote(result.projectId)) ?? "not recognized from the remote URL"} — if unknown or wrong, ask the owner which forge the repo lives on and record it with town_set_rig_forge.`,
       ].join("\n");
+    },
+  });
+  bb.agents.registerTool({
+    name: "town_set_rig_forge",
+    description: "Pin (or clear) the forge for a rig: which CLI the town uses for its pull/merge requests. Use when the forge cannot be inferred from the remote (e.g. a homelab host such as https://git.example.com) or when inference guessed wrong. Accepts gh, glab, gt (gitea-cli), tea (legacy), none, or auto (clear the pin and infer from the remote again).",
+    parameters: z.object({
+      projectId: z.string().describe("The rig's project id."),
+      forge: z.string().describe("gh | glab | gt | tea | none (never forge-aware) | auto (clear the pin, infer from remote). Aliases: github→gh, gitlab→glab, gitea/forgejo/gitea-cli→gt."),
+    }),
+    async execute({ projectId, forge }, context) {
+      const caller = context.threadId ? roles.get(context.threadId) : undefined;
+      if (!caller || caller.role !== "mayor" || ["complete", "archived", "deleted"].includes(caller.state)) {
+        throw new Error("town_set_rig_forge requires an active registered Mayor thread.");
+      }
+      const normalized = forge.trim().toLowerCase();
+      const pin = FORGE_ALIASES[normalized] ?? normalized;
+      if (!["gh", "glab", "gt", "tea", "none", "auto"].includes(pin)) {
+        throw new Error(`Unknown forge “${forge}”. Use one of: gh, glab, gt, tea, none, auto.`);
+      }
+      const rig = rigById.get(projectId) as RigRow | undefined;
+      if (!rig) throw new Error(`No rig registered for project ${projectId}.`);
+      const value = pin === "auto" ? null : pin;
+      db.prepare(`UPDATE rigs SET forge=? WHERE project_id=?`).run(value, projectId);
+      publishTown();
+      logEvent("rig", `Forge for rig ${rig.name} ${value ? `pinned to ${value}` : "pin cleared (auto-infer from remote)"}`);
+      const effective = await resolveForge(projectId);
+      const cli = effective.cli ?? "none available — briefs will tell workers not to run forge commands";
+      return `Forge for rig “${rig.name}” set to ${value ?? "auto"} (effective: ${effective.forge ?? "none"} via ${cli}).`;
     },
   });
   bb.agents.registerTool({
@@ -2523,7 +3169,7 @@ export default async function plugin(bb: BbPluginApi) {
   });
   bb.agents.registerTool({
     name: "town_complete",
-    description: "Mark a managed thread complete after verifying its evidence; closes the linked bead in the ledger.",
+    description: "Mark a managed thread complete after verifying its evidence; closes the linked bead in the ledger and, by default, archives the thread so bb can clean up its worktree (skipped while reviewers are still running against it).",
     parameters: completeParams,
     async execute(params, context) {
       const caller = context.threadId ? roles.get(context.threadId) : undefined;
@@ -2531,18 +3177,42 @@ export default async function plugin(bb: BbPluginApi) {
       if (!caller || caller.role !== "mayor" || !target || !belongsToMayor(target, caller.thread_id)) {
         throw new Error(`No managed thread ${params.threadId} for this Mayor.`);
       }
-      const row = await complete(params.threadId, params.result);
-      return `Marked “${row.title}” complete.${row.note}`;
+      const result = await complete(params.threadId, params.result, { archive: params.archive });
+      return `Marked “${result.title}” complete.${result.note}`;
     },
   });
   bb.agents.registerTool({
     name: "polecat_report",
-    description: "Report managed work state and evidence to the Mayor. Use ready, not complete; blocked requires blocker and recommendation.",
+    description: "Report managed work state and evidence. Polecats report to the Mayor; reviewers report to whoever commissioned the review. Use ready, not complete; blocked requires blocker and recommendation.",
     parameters: reportParams,
     async execute(params, context) {
       if (!context.threadId) throw new Error("polecat_report requires a thread context.");
       await report(context.threadId, params);
-      return "Report delivered to the Mayor.";
+      return "Report delivered.";
+    },
+  });
+  bb.agents.registerTool({
+    name: "polecat_request_review",
+    description: "Request an adversarial review of YOUR OWN work. Reviewers work in your worktree and report their findings to this thread; fix what they find, then request again until a verdict is ship — then call polecat_report with state ready. Use when your work is complete and you want it verified before reporting ready.",
+    parameters: z.object({
+      focus: z.string().trim().max(4_000).optional().describe("What the review should concentrate on."),
+      ...reviewSpecParams,
+    }),
+    async execute(params, context) {
+      const caller = context.threadId ? roles.get(context.threadId) : undefined;
+      if (!context.threadId || !caller || caller.role !== "polecat" || ["complete", "archived", "deleted"].includes(caller.state)) {
+        throw new Error("polecat_request_review is only available in an active managed polecat thread.");
+      }
+      const spec = reviewSpecFrom(params);
+      const result = await startReview(caller.thread_id, spec, "polecat");
+      if (!result.created) {
+        return `A review of your work is already in progress (${result.reviewers.map((r) => r.title).join("; ")}). Wait for their findings in this thread.`;
+      }
+      return [
+        `Review requested (${spec.mode}): ${result.reviewers.map((r) => r.title).join("; ")}.`,
+        "The reviewer(s) work in your worktree and their findings will arrive in this thread.",
+        "Fix what they find, commit, and request a fresh review until the verdict is ship — then report ready.",
+      ].join("\n");
     },
   });
 
@@ -2636,11 +3306,12 @@ export default async function plugin(bb: BbPluginApi) {
       return { tools: [], skills: [] };
     }
     const rules = row ? (rulesCache.get(row.project_id) ?? BUILT_IN_RULES) : BUILT_IN_RULES;
+    // rulesCache is refreshed on every spawn, reconcile cycle, and readRules call.
     if (role === "mayor") {
       return {
-        tools: ["town_sling", "town_roster", "town_inspect", "town_nudge", "town_convoy", "town_ready", "town_complete", "town_review", "town_verify", "town_land", "town_create_rig", "town_pr_review", "town_buzzard", "town_imperator", "town_adopt", "town_adopt_pr"],
+        tools: ["town_sling", "town_roster", "town_inspect", "town_nudge", "town_convoy", "town_ready", "town_complete", "town_review", "town_verify", "town_land", "town_create_rig", "town_set_rig_forge", "town_pr_review", "town_buzzard", "town_imperator", "town_adopt", "town_adopt_pr"],
         skills: ["mayor"],
-        instructions: `You are the registered Mayor supervising the town's polecat threads from ${context.project.name}. Decompose goals into convoys (town_convoy), sling beads to polecats (town_sling), and drive work through verification (town_verify, town_review) and delivery (town_land) to verified completion (town_complete).\n\n${rules}`,
+        instructions: `You are the registered Mayor supervising the town's polecat threads from ${context.project.name}. Decompose goals into convoys (town_convoy), sling beads to polecats (town_sling), and drive work through verification (town_verify) and delivery (town_land) to verified completion (town_complete). Polecats review their own work before reporting ready.\n\n${rules}`,
       };
     }
     if (role === "buzzard") {
@@ -2657,6 +3328,13 @@ export default async function plugin(bb: BbPluginApi) {
         instructions: `You are the town's Imperator: patrol for security problems. Report ONLY to the Mayor in this thread; never create issues, PRs, or public posts about security findings.\n\n${rules}`,
       };
     }
+    if (role === "polecat") {
+      return {
+        tools: ["polecat_report", "polecat_request_review"],
+        skills: ["polecat"],
+        instructions: `You are a managed polecat reporting to the Mayor of this town.\n\n${rules}`,
+      };
+    }
     return {
       tools: ["polecat_report"],
       skills: ["polecat"],
@@ -2667,7 +3345,7 @@ export default async function plugin(bb: BbPluginApi) {
   bb.rpc.register(rpcContract, {
     status: () => buildStatus(),
     start: ({ projectId }) => ensureMayor(projectId ?? undefined),
-    rigAdd: ({ projectId }) => addRig(projectId),
+    rigAdd: ({ projectId, forge }) => addRig(projectId, forge),
     rigRemove: ({ projectId }) => ({ removed: removeRig(projectId) }),
     projectsList: async () => ({
       projects: (await bb.sdk.projects.list()).map((project) => ({
@@ -2711,6 +3389,7 @@ export default async function plugin(bb: BbPluginApi) {
     "  bb madmax rig list [--json]",
     "  bb madmax rig add <project-id>",
     "  bb madmax rig remove <project-id>",
+    "  bb madmax rig forge <project-id> <gh|glab|gt|tea|none|auto>",
     "  bb madmax rig clone <git-url> [--name <name>] [--json]",
     "  bb madmax sling --bead <bead-id> [--rig <project-id>] [--tier <tier>] [--json]",
     "  bb madmax sling --title \"…\" --mission \"…\" [--criteria \"…\"]... [--constraint \"…\"]... [--context \"…\"] [--rig <project-id>] [--tier <tier>] [--json]",
@@ -2800,8 +3479,13 @@ export default async function plugin(bb: BbPluginApi) {
         if (command === "rig") {
           const [sub, target] = args.positional;
           if (sub === "list") {
-            const rigs = (allRigs.all() as RigRow[]).map((row) => ({ projectId: row.project_id, name: row.name, registeredAt: row.registered_at }));
-            return ok({ rigs }, rigs.length ? rigs.map((rig) => `${rig.name.padEnd(20)} ${rig.projectId}`).join("\n") : "No rigs registered.");
+            const rigs = (allRigs.all() as RigRow[]).map((row) => ({ projectId: row.project_id, name: row.name, forge: row.forge ?? null, registeredAt: row.registered_at }));
+            return ok(
+              { rigs },
+              rigs.length
+                ? rigs.map((rig) => `${rig.name.padEnd(20)} ${rig.projectId}${rig.forge ? `  forge=${rig.forge}` : ""}`).join("\n")
+                : "No rigs registered.",
+            );
           }
           if (sub === "add") {
             const projectId = target ?? args.one("project");
@@ -2816,6 +3500,23 @@ export default async function plugin(bb: BbPluginApi) {
             if (!parsed.success) return fail(`Invalid rig clone request: ${parsed.error.issues[0]?.message ?? "check the arguments"}`);
             const result = await createRig(parsed.data);
             return ok(result, `Rig “${result.name}” cloned and registered (${result.projectId}) at ${result.path}.`);
+          }
+          if (sub === "forge") {
+            const projectId = target ?? args.one("project");
+            const value = args.one("forge") ?? args.positional[2];
+            if (!projectId || !value) return fail("rig forge requires <project-id> <gh|glab|gt|tea|none|auto>");
+            const normalized = value.trim().toLowerCase();
+            const pin = FORGE_ALIASES[normalized] ?? normalized;
+            if (!["gh", "glab", "gt", "tea", "none", "auto"].includes(pin)) {
+              return fail(`Unknown forge “${value}”. Use one of: gh, glab, gt, tea, none, auto (auto infers from the remote).`);
+            }
+            const row = rigById.get(projectId) as RigRow | undefined;
+            if (!row) return fail(`No rig ${projectId}. Register it first: bb madmax rig add ${projectId}`);
+            const stored = pin === "auto" ? null : pin;
+            db.prepare(`UPDATE rigs SET forge=? WHERE project_id=?`).run(stored, projectId);
+            logEvent("rig", `Forge for rig ${row.name} ${stored ? `pinned to ${stored}` : "pin cleared (auto-infer from remote)"}`);
+            const effective = await resolveForge(projectId);
+            return ok({ rig: projectId, forge: stored, effective }, `Forge for “${row.name}” set to ${stored ?? "auto"} (effective: ${effective.forge ?? "none"} via ${effective.cli ?? "no CLI"}).`);
           }
           if (sub === "remove") {
             const projectId = target ?? args.one("project");

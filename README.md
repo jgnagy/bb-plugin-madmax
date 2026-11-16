@@ -30,17 +30,21 @@ ledger, and your own `bd` commands interoperate with the town's.
 
 **Conversational rig onboarding.** "I'd like to make a PR for \<github
 repo\> to fix \<issue\>" works end to end: the Mayor clones the repo into
-the town's `rigs/` directory, reads the issue with `gh`, slings a bead
+the town's `rigs/` directory, reads the issue with the rig's forge CLI
+(`gh` on GitHub), slings a bead
 tagged with the rig, and delivers the branch when the work verifies.
 Opening the PR is owner-approved at dispatch and travels in the polecat's
 brief.
 
-**Adversarial reviews before landing.** Lite mode (one reviewer) or full
-mode (one reviewer per criterion — security, maintainability, performance,
-quality, or your own), each working as a persona you name. Every review
-runs three phases — findings with HIGH/MEDIUM/LOW confidence, verification
-of the HIGH findings, then a ship/fix verdict — and the Mayor drives the
-fix loop until the verdict is clean.
+**Adversarial reviews before landing.** Polecats review their own work:
+when a polecat finishes, it requests a review in its own worktree, fixes
+what the reviewer finds, and asks again until the verdict is ship. Lite mode
+(one reviewer) or full mode (one reviewer per criterion — security,
+maintainability, performance, quality, or your own), each working as a
+persona you name. Every review runs three phases — findings with
+HIGH/MEDIUM/LOW confidence, verification of the HIGH findings, then a
+ship/fix verdict — and findings route straight back to the worker. You can
+also commission one yourself for an owner-level deep dive.
 
 **PR review as a task.** Point the Mayor at someone else's pull request:
 it finds or creates the rig, mints a dedicated bead, and spawns reviewer
@@ -59,7 +63,11 @@ reports **only** to the Mayor: never issues, never PRs, never public posts.
 worktree (status, diff, log) before anyone trusts a report; `town_land`
 commits uncommitted work, pushes the branch to the rig's origin, and moves
 the bead to review. Merges, PRs to default branches, and anything
-irreversible stay yours.
+irreversible stay yours. PRs your polecats open are watched: when the
+forge reports one merged, the bead closes and the thread is completed and
+archived (an active reviewer defers the archive; a PR closed unmerged alerts
+the Mayor instead). A closed PR watch needs a working forge
+CLI for that rig — see "Forges" below.
 
 **Town Hall.** A sidebar page with the town problems-first: blocked and
 failed threads under "Needs attention", and a task board that mirrors the
@@ -105,7 +113,8 @@ beads, polecats, or Mayors in them.
 | Sling / Nudge | `town_sling` / `town_nudge` → `threads.spawn` / `threads.send` |
 | Report | `polecat_report` (ready/blocked) → durable outbox → Mayor thread |
 | Deacon | Background supervisor: reconcile, stall detection, lease heartbeats |
-| Refinery | `town_verify` → `town_review` → `town_land` → `town_complete` |
+| Polecat self-review | `polecat_request_review` in the polecat's own worktree; findings route back to the polecat |
+| Refinery | `town_verify` → polecat review loop → `town_land` → `town_complete` (auto on merge) |
 | Town Hall | Dashboard page: problems, convoy board, roster, activity feed |
 
 Polecats run `accept-edits` by default: they can edit freely inside their
@@ -115,7 +124,7 @@ PRs — flows polecat → Mayor → you.
 ## Install
 
 ```
-bb plugin install "git:https://github.com/jgnagy/bb-plugin-madmax.git@semver:>=0.4.0" --yes
+bb plugin install "git:https://github.com/jgnagy/bb-plugin-madmax.git@semver:>=0.5.0" --yes
 ```
 
 (Quote the source: shells otherwise interpret `>=` as a redirection,
@@ -123,10 +132,32 @@ as zsh does by default.)
 
 Install [Beads](https://github.com/gastownhall/beads) (`bd` 1.0+) on the
 machine running the bb server and put it on `PATH` — it is the ledger.
-`git` and `gh` (authenticated) are used for cloning, verification, delivery,
-and pull requests. The `>=` range floats across 0.x minors so
-`bb plugin update madmax` picks up new releases; a caret range (`^0.4.0`)
-would pin the minor.
+`git` is used for cloning, verification, and delivery. For pull/merge
+request work the town uses the forge CLI for each rig — see below. The
+`>=` range floats across 0.x minors so `bb plugin update madmax` picks up
+new releases; a caret range (`^0.5.0`) would pin the minor.
+
+## Forges: GitHub, GitLab, and Gitea/Forgejo
+
+The town is not GitHub-only. Every rig gets its forge detected per project:
+
+- **Inferred from the remote URL.** `github.com` hosts map to `gh`,
+  `gitlab.*` hosts to `glab`, `gitea`/`forgejo`/`codeberg.org` hosts to
+  `tea`. If the clone URL's host doesn't say what forge it is (for example
+  a homelab `https://git.example.com/...`), nothing is guessed — the Mayor
+  asks you which forge it is, and records the answer with
+  `bb madmax rig forge <project-id> <gh|glab|tea|none|auto>` (or the
+  `town_set_rig_forge` tool). `none` opts a rig out of forge automation;
+  `auto` clears a pin and infers from the remote again.
+- **`gh`, `glab`, or `tea`**, whichever matches — install and authenticate
+  the one(s) you use. If a CLI is missing for a detected forge, the rig
+  degrades gracefully: polecats push branches and report the result, and
+  the owner opens the pull request.
+- **Pinned or inferred, per rig.** A town can hold a GitHub rig and a
+  homelab Forgejo rig side by side; PR creation, PR review, PR adoption,
+  Buzzard drafts, and the merged-PR watcher all follow the rig's forge.
+- The merged-PR watcher needs the forge CLI on the bead's rig. Without it,
+  PRs are still delivered normally — nothing closes itself automatically.
 
 ## Upgrading
 
@@ -136,13 +167,13 @@ bb plugin update madmax         # update in place — town state survives
 ```
 
 `update` re-resolves the range your install recorded: a `>=` install
-floats to every new tagged release, while a caret (`^0.4.0`) pins the 0.x
+floats to every new tagged release, while a caret (`^0.5.0`) pins the 0.x
 minor and an exact pin (`0.3.0`) pins the patch. To jump outside the
-recorded range — say from `^0.2.0` to 0.4.0 — reinstall:
+recorded range — say from `^0.2.0` to 0.5.0 — reinstall:
 
 ```
 bb plugin remove madmax
-bb plugin install "git:https://github.com/jgnagy/bb-plugin-madmax.git@semver:>=0.4.0" --yes
+bb plugin install "git:https://github.com/jgnagy/bb-plugin-madmax.git@semver:>=0.5.0" --yes
 ```
 
 `remove` clears the plugin's settings (such as `townProject`), so re-set
@@ -179,7 +210,7 @@ on every patrol cycle.
 ```
 bb madmax status | start | init
 bb madmax ledger init | status
-bb madmax rig list | add | remove | clone
+bb madmax rig list | add | remove | clone | forge
 bb madmax sling --bead <id> | --title "…" --mission "…"
 bb madmax nudge | inspect | review | verify | land <thread-id>
 bb madmax buzzard | imperator --rig <proj-id> | --git-url <url>
@@ -197,6 +228,7 @@ prints everything.
 | `mayor` / `reviewer` / `buzzard` / `imperator` (×3 each) | Provider/model/reasoning per role |
 | `polecatPermissionMode` | Polecat permissions (`accept-edits` default) |
 | `stallMinutes` | How long an active thread runs before the Mayor is alerted |
+| `mergeWatch` | Close out merged PRs automatically — bead closes, thread completed and archived (default on; archive waits while a reviewer is still running) |
 | `rigsDir` | Where cloned rigs live (empty = `<town>/rigs`) |
 | `buzzardCron` / `imperatorCron` | Scheduled patrol crons (empty = off; reload the plugin after changing) |
 | `buzzardUnmaintained` | Buzzard also flags unmaintained dependencies |

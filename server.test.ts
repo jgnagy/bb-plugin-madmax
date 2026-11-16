@@ -15,7 +15,7 @@ import {
   makePluginAgentConfigurationContext,
   makeThreadResponse,
 } from "@get-bb/plugin-sdk/testing";
-import plugin, { type Bead } from "./server";
+import plugin, { detectGiteaCli, forgeFromRemote, looksLikeGiteaCli, parseForgePrState, parsePrUrls, type Bead } from "./server";
 
 const execFileAsync = promisify(execFile);
 const bdAvailable = await execFileAsync("bd", ["--version"])
@@ -96,8 +96,75 @@ describe("madmax town backend", () => {
     );
   });
 
+  it("scopes town-local skills by role: mayor sees owner skills, polecats don't", async () => {
+    const host = await makeHost();
+    host.harness.inspection.sdk.stub("threadSections.list", () => []);
+    host.harness.inspection.sdk.stub("threadSections.create", () => ({ id: "sec_town", name: "Town" }));
+    host.harness.inspection.sdk.stub("hosts.list", () => [{ id: "host_1", status: "connected" }]);
+    host.harness.inspection.sdk.stub("threads.send", () => ({ ok: true }));
+    host.harness.inspection.sdk.stub("threads.archive", () => ({ ok: true }));
+    let spawnCounter = 0;
+    host.harness.inspection.sdk.stub("threads.spawn", () =>
+      makeThreadResponse({ id: `thr_towntest_${spawnCounter++}`, status: "starting" }));
+    const townDir = await mkdtemp(join(tmpdir(), "madmax-town-"));
+    const { mkdir, writeFile } = await import("node:fs/promises");
+    await mkdir(join(townDir, "skills", "shared", "release-ritual"), { recursive: true });
+    await mkdir(join(townDir, "skills", "mayor", "budgeting"), { recursive: true });
+    await mkdir(join(townDir, "skills", "polecat", "flaky-tests"), { recursive: true });
+    await writeFile(join(townDir, "town.md"), "# Town rules\n\nReleases happen on Tuesdays.\n");
+    await writeFile(
+      join(townDir, "skills", "shared", "release-ritual", "SKILL.md"),
+      "---\nname: release-ritual\ndescription: How this town cuts a release\n---\n\nTag vX.Y.Z, then push.\n",
+    );
+    await writeFile(
+      join(townDir, "skills", "mayor", "budgeting", "SKILL.md"),
+      "---\nname: budgeting\ndescription: How the Mayor accounts for model spend\n---\n\nSpend wisely.\n",
+    );
+    await writeFile(
+      join(townDir, "skills", "polecat", "flaky-tests", "SKILL.md"),
+      "---\nname: flaky-tests\ndescription: Retrying flaky tests the town way\n---\n\nRerun once, then quarantine.\n",
+    );
+    host.harness.inspection.sdk.stub("projects.get", (args: { projectId: string }) => ({
+      id: args.projectId,
+      name: "MyTown",
+      sources: [{ id: "src_1", projectId: args.projectId, hostId: "host_1", isDefault: true, path: townDir, type: "local_path" }],
+    }));
+    host.harness.inspection.sdk.stub("projects.fileContent", () => ({
+      content: "# Town rules\n\nReleases happen on Tuesdays.\n",
+      contentEncoding: "utf8",
+    }));
+
+    await host.harness.behavior.callRpc("start", { projectId: "proj_town" });
+    const spawns = host.harness.inspection.sdk.callsTo("threads.spawn");
+    const mayorPrompt = String((spawns[0]![0] as { prompt: string }).prompt);
+    expect(mayorPrompt).toContain(townDir);
+    expect(mayorPrompt).toContain("town.md");
+    expect(mayorPrompt).toContain("Releases happen on Tuesdays.");
+    expect(mayorPrompt).toContain("release-ritual");
+    expect(mayorPrompt).toContain("budgeting");
+    expect(mayorPrompt).toContain("Spend wisely.");
+    expect(mayorPrompt).not.toContain("flaky-tests"); // polecat-only
+
+    // Sling a polecat and check its brief sees shared + polecat skills, not mayor-only ones.
+    await host.harness.behavior.callAgentTool(
+      "town_sling",
+      { title: "Fix the cart", mission: "Fix the cart total bug." },
+      { threadId: "thr_towntest_0" },
+    );
+    const spawnsAfter = host.harness.inspection.sdk.callsTo("threads.spawn");
+    const polecatSpawn = spawnsAfter.find((call) =>
+      String((call[0] as { pluginMetadata?: { role?: string } }).pluginMetadata?.role) === "polecat",
+    );
+    expect(polecatSpawn).toBeDefined();
+    const polecatPrompt = String((polecatSpawn![0] as { prompt: string }).prompt);
+    expect(polecatPrompt).toContain("release-ritual");
+    expect(polecatPrompt).toContain("flaky-tests");
+    expect(polecatPrompt).not.toContain("budgeting");
+  });
+
   it("slings with owner-approved PR authorization in the brief", async () => {
     const host = await makeHost();
+    await host.harness.behavior.callRpc("rigAdd", { projectId: "proj_rig", forge: "gh" });
     const { started } = await startTown(host);
     await host.harness.behavior.callAgentTool(
       "town_sling",
@@ -105,6 +172,7 @@ describe("madmax town backend", () => {
         title: "Fix checkout totals",
         mission: "Totals double-count tax; fix and verify with the cart test.",
         openPr: true,
+        rigProjectId: "proj_rig",
       },
       { threadId: started.threadId },
     );
@@ -112,7 +180,7 @@ describe("madmax town backend", () => {
     const prompt = (spawns[spawns.length - 1]![0] as { prompt: string }).prompt;
     expect(prompt).toContain("The owner approved opening a pull request for this task.");
     expect(prompt).toContain("gh pr create");
-    expect(prompt).toContain("Put the pull request URL in your final report.");
+    expect(prompt).toContain("Put the pull/merge request URL in your final report.");
   });
 
   it("adopts an existing thread as a polecat and re-points a Mayor", async () => {
@@ -154,7 +222,7 @@ describe("madmax town backend", () => {
     const configuration = await host.harness.behavior.resolveAgentConfiguration(
       makePluginAgentConfigurationContext({ thread: { id: "thr_pre_madmax" } }),
     );
-    expect(configuration.tools.map((tool: { name: string }) => tool.name)).toEqual(["polecat_report"]);
+    expect(configuration.tools.map((tool: { name: string }) => tool.name)).toEqual(["polecat_report", "polecat_request_review"]);
 
     // Adopting a new Mayor retires the old one and re-points the roster.
     host.harness.inspection.sdk.stub("threads.get", (args: { threadId: string }) =>
@@ -409,7 +477,7 @@ describe("madmax town backend", () => {
     const status = (await host.harness.behavior.callRpc("status", null)) as {
       rigs: { projectId: string; name: string }[];
     };
-    expect(status.rigs).toEqual([{ projectId: "proj_rig", name: "Rig One", registeredAt: expect.any(Number) }]);
+    expect(status.rigs).toEqual([{ projectId: "proj_rig", name: "Rig One", forge: null, registeredAt: expect.any(Number) }]);
     const removed = (await host.harness.behavior.callRpc("rigRemove", { projectId: "proj_rig" })) as {
       removed: boolean;
     };
@@ -621,6 +689,7 @@ describe.skipIf(!bdAvailable)("madmax ledger (real bd)", () => {
     host.harness.inspection.sdk.stub("threads.spawn", () =>
       makeThreadResponse({ id: `thr_ledger_${counter++}`, status: "starting" }));
     host.harness.inspection.sdk.stub("threads.send", () => ({ ok: true }));
+    host.harness.inspection.sdk.stub("threads.archive", () => ({ ok: true }));
     host.harness.inspection.sdk.stub("threads.get", (args: { threadId: string }) =>
       makeThreadResponse({ id: args.threadId, status: "idle", environmentId: "env_work_1" }));
     await host.harness.behavior.setSettings({ townProject: "proj_town" });
@@ -798,10 +867,34 @@ describe.skipIf(!bdAvailable)("madmax ledger (real bd)", () => {
       { threadId: mayorId },
     );
     expect(String(completed)).toContain("closed in the ledger");
+    expect(String(completed)).toContain("archived");
+    const archiveCalls = host.harness.inspection.sdk.callsTo("threads.archive");
+    expect(archiveCalls.some((call) => (call[0] as { threadId: string }).threadId === polecat.threadId)).toBe(true);
 
     const afterComplete = await bdList(dir);
     const closed = afterComplete.find((issue) => issue.id === bead.id)!;
     expect(closed.status).toBe("closed");
+  });
+
+  it("town_complete refuses to archive while a reviewer is still running", async () => {
+    const { host, dir, mayorId } = await makeLedgerHost();
+    const polecatId = await slingFirstBead(host, dir, mayorId);
+
+    // Polecat requests its own review — the reviewer is now in flight.
+    await host.harness.behavior.callAgentTool(
+      "polecat_request_review",
+      { mode: "lite" },
+      { threadId: polecatId },
+    );
+
+    const completed = await host.harness.behavior.callAgentTool(
+      "town_complete",
+      { threadId: polecatId, result: "Work verified; archiving is unsafe mid-review." },
+      { threadId: mayorId },
+    );
+    expect(String(completed)).toContain("reviewer");
+    const archiveCalls = host.harness.inspection.sdk.callsTo("threads.archive");
+    expect(archiveCalls.some((call) => (call[0] as { threadId: string }).threadId === polecatId)).toBe(false);
   });
 
   /** A real git worktree with a bare origin, a polecat branch, and uncommitted work. */
@@ -1077,8 +1170,8 @@ describe.skipIf(!bdAvailable)("madmax ledger (real bd)", () => {
         workspace: { type: "managed-worktree", baseBranch: { kind: "default" } },
       });
       const prompt = spawn.prompt as string;
-      expect(prompt).toContain("gh pr checkout 7");
-      expect(prompt).toContain("gh pr diff 7");
+      expect(prompt).toContain("git fetch origin refs/pull/7/head");
+      expect(prompt).toContain("git checkout -b review-pr-7 FETCH_HEAD");
       expect(prompt).toContain("Do not modify files");
     }
 
@@ -1095,7 +1188,7 @@ describe.skipIf(!bdAvailable)("madmax ledger (real bd)", () => {
 
   it("town_buzzard and town_imperator dispatch patrols with role briefs", async () => {
     const { host, mayorId } = await makeLedgerHost();
-    await host.harness.behavior.callRpc("rigAdd", { projectId: "proj_rig" });
+    await host.harness.behavior.callRpc("rigAdd", { projectId: "proj_rig", forge: "gh" });
 
     const buzzard = await host.harness.behavior.callAgentTool(
       "town_buzzard",
@@ -1177,6 +1270,7 @@ describe.skipIf(!bdAvailable)("madmax ledger (real bd)", () => {
     host.harness.inspection.sdk.stub("threads.spawn", () =>
       makeThreadResponse({ id: `thr_patrol_${counter++}`, status: "starting" }));
     host.harness.inspection.sdk.stub("threads.send", () => ({ ok: true }));
+    host.harness.inspection.sdk.stub("threads.archive", () => ({ ok: true }));
     await host.harness.behavior.setSettings({ townProject: "proj_town" });
     await host.harness.behavior.callRpc("start", { projectId: "proj_town" });
     await host.harness.behavior.callRpc("rigAdd", { projectId: "proj_rig" });
@@ -1238,7 +1332,7 @@ describe.skipIf(!bdAvailable)("madmax ledger (real bd)", () => {
       workspace: { type: "managed-worktree", baseBranch: { kind: "default" } },
     });
     const prompt = spawn.prompt as string;
-    expect(prompt).toContain("gh pr checkout 7");
+    expect(prompt).toContain("git fetch origin refs/pull/7/head");
     expect(prompt).toContain("Push commits to the pull request branch");
     expect(prompt).toContain("Do not post comments, reviews, or approvals. Do not merge.");
     expect(prompt).toContain("No internal vocabulary");
@@ -1283,5 +1377,241 @@ describe.skipIf(!bdAvailable)("madmax ledger (real bd)", () => {
     };
     expect(after.ledger?.initialized).toBe(true);
     expect(after.ledger?.path).toBe(dir);
+  });
+  it("a polecat requests its own review; findings route back to the polecat; re-review works after reporting", async () => {
+    const { host, dir, mayorId } = await makeLedgerHost();
+    const polecatId = await slingFirstBead(host, dir, mayorId);
+
+    const requested = await host.harness.behavior.callAgentTool(
+      "polecat_request_review",
+      { mode: "lite", focus: "correctness" },
+      { threadId: polecatId },
+    );
+    expect(String(requested)).toContain("Review requested");
+
+    const spawns = host.harness.inspection.sdk.callsTo("threads.spawn");
+    const reviewerSpawn = spawns[spawns.length - 1]![0] as Record<string, unknown>;
+    expect(reviewerSpawn.environment).toEqual({ type: "reuse", environmentId: "env_work_1" });
+    expect(reviewerSpawn.parentThreadId).toBe(polecatId);
+    expect(reviewerSpawn.pluginMetadata).toMatchObject({ role: "reviewer" });
+
+    // A second request while the reviewer is pending is a no-op.
+    const again = await host.harness.behavior.callAgentTool(
+      "polecat_request_review",
+      {},
+      { threadId: polecatId },
+    );
+    expect(String(again)).toContain("already in progress");
+    expect(host.harness.inspection.sdk.callsTo("threads.spawn")).toHaveLength(spawns.length);
+
+    // The reviewer reports; the findings must land in the POLECAT thread, not the Mayor's.
+    // Find the reviewer thread id via the town roster.
+    const roster = (await host.harness.behavior.callRpc("status", null)) as {
+      threads: { threadId: string; role: string }[];
+    };
+    const reviewer = roster.threads.find((thread) => thread.role === "reviewer")!;
+    expect(reviewer).toBeDefined();
+
+    await host.harness.behavior.callAgentTool(
+      "polecat_report",
+      { state: "ready", result: "Fixed. Verdict: ship." },
+      { threadId: reviewer.threadId },
+    );
+    const sends = host.harness.inspection.sdk.callsTo("threads.send") as [unknown][];
+    const reviewNotices = sends
+      .map((args) => args[0] as { threadId?: string; input?: { text?: string }[] })
+      .filter((payload) => JSON.stringify(payload).includes("Reviewer report"));
+    expect(reviewNotices.length).toBeGreaterThan(0);
+    for (const notice of reviewNotices) expect(notice.threadId).toBe(polecatId);
+
+    // After the reviewer reported, a fresh review request spawns a NEW reviewer.
+    const respawn = await host.harness.behavior.callAgentTool(
+      "polecat_request_review",
+      {},
+      { threadId: polecatId },
+    );
+    expect(String(respawn)).toContain("Review requested");
+    expect(host.harness.inspection.sdk.callsTo("threads.spawn").length).toBeGreaterThan(spawns.length);
+  });
+
+  it("town_review findings route to the Mayor, not the polecat", async () => {
+    const { host, dir, mayorId } = await makeLedgerHost();
+    const polecatId = await slingFirstBead(host, dir, mayorId);
+
+    await host.harness.behavior.callAgentTool(
+      "town_review",
+      { threadId: polecatId },
+      { threadId: mayorId },
+    );
+    const roster = (await host.harness.behavior.callRpc("status", null)) as {
+      threads: { threadId: string; role: string }[];
+    };
+    const reviewer = roster.threads.find((thread) => thread.role === "reviewer")!;
+    await host.harness.behavior.callAgentTool(
+      "polecat_report",
+      { state: "ready", result: "One HIGH finding: missing auth check." },
+      { threadId: reviewer.threadId },
+    );
+    const sends = host.harness.inspection.sdk.callsTo("threads.send") as [unknown][];
+    const reviewNotices = sends
+      .map((args) => args[0] as { threadId?: string })
+      .filter((payload) => JSON.stringify(payload).includes("Reviewer report"));
+    expect(reviewNotices.length).toBeGreaterThan(0);
+    for (const notice of reviewNotices) expect(notice.threadId).toBe(mayorId);
+  });
+
+});
+
+describe("forge detection", () => {
+  const hosts: Host["host"][] = [];
+
+  afterEach(async () => {
+    for (const host of hosts.splice(0)) await host.harness.lifecycle.dispose();
+  });
+
+  async function makeForgeHost() {
+    const host = createFakePluginHost({ pluginId: "madmax", agentSkillIds: ["mayor", "polecat"] });
+    hosts.push(host);
+    await plugin(host.bb);
+    host.harness.inspection.sdk.stub("threadSections.list", () => []);
+    host.harness.inspection.sdk.stub("threadSections.create", () => ({ id: "sec_town", name: "Town" }));
+    host.harness.inspection.sdk.stub("projects.get", (args: { projectId: string }) => ({
+      id: args.projectId,
+      name: args.projectId === "proj_rig" ? "Rig One" : "MyTown",
+    }));
+    host.harness.inspection.sdk.stub("hosts.list", () => [{ id: "host_1", status: "connected" }]);
+    let counter = 0;
+    host.harness.inspection.sdk.stub("threads.spawn", () => {
+      const thread = makeThreadResponse({ id: `thr_forge_${counter++}`, status: "starting" });
+      return thread;
+    });
+    host.harness.inspection.sdk.stub("threads.send", () => ({ ok: true }));
+    host.harness.inspection.sdk.stub("threads.archive", () => ({ ok: true }));
+    const started = (await host.harness.behavior.callRpc("start", { projectId: "proj_town" })) as {
+      threadId: string;
+      created: boolean;
+    };
+    return { host, started };
+  }
+
+  it("distinguishes the real gitea-cli (gt) from other gt binaries", () => {
+    expect(looksLikeGiteaCli("gt version 1.2.0\nhttps://gitea.com/gitea/cli/releases/tag/v1.2.0\nbuilt with go1.27.3")).toBe(true);
+    expect(looksLikeGiteaCli("gt version 1.4.27 (Graphite)\nhttps://graphite.dev")).toBe(false);
+    expect(looksLikeGiteaCli("gt version 0.9.0")).toBe(false);
+  });
+
+  it("detectGiteaCli prefers verified gt, falls back to tea, else null", async () => {
+    // gt is gitea-cli
+    expect(await detectGiteaCli(async (bin) => (bin === "gt" ? "gt version 1.2.0\nhttps://gitea.com/gitea/cli" : (() => { throw new Error("no tea"); })()))).toBe("gt");
+    // gt is some other tool, tea exists -> tea
+    expect(await detectGiteaCli(async (bin) => {
+      if (bin === "gt") return "gt version 1.4.27 (Graphite)";
+      if (bin === "tea") return "tea 0.9.2";
+      throw new Error("missing");
+    })).toBe("tea");
+    // gt is some other tool, no tea -> null (never silently treat it as Gitea's)
+    expect(await detectGiteaCli(async (bin) => {
+      if (bin === "gt") return "gt version 1.4.27 (Graphite)";
+      throw new Error("missing");
+    })).toBeNull();
+    // nothing installed -> null
+    expect(await detectGiteaCli(async () => { throw new Error("missing"); })).toBeNull();
+  });
+
+  it("maps remote URLs to forges by host, never by path", () => {
+    expect(forgeFromRemote("https://github.com/acme/repo.git")).toBe("github");
+    expect(forgeFromRemote("git@github.com:acme/repo.git")).toBe("github");
+    expect(forgeFromRemote("ssh://git@github.acme-corp.example:2222/acme/repo.git")).toBe("github");
+    expect(forgeFromRemote("https://gitlab.com/acme/repo.git")).toBe("gitlab");
+    expect(forgeFromRemote("git@gitlab.internal.example:acme/repo.git")).toBe("gitlab");
+    expect(forgeFromRemote("https://codeberg.org/acme/repo.git")).toBe("gitea");
+    expect(forgeFromRemote("https://forgejo.example.com/acme/repo.git")).toBe("gitea");
+    expect(forgeFromRemote("https://git.example.com/acme/repo.git")).toBeNull();
+    expect(forgeFromRemote("https://example.com/github-mirror/repo.git")).toBeNull();
+    expect(forgeFromRemote("/local/path/repo")).toBeNull();
+    expect(forgeFromRemote(null)).toBeNull();
+  });
+
+  it("extracts PR/MR URLs from report text", () => {
+    const found = parsePrUrls(
+      "Opened https://github.com/acme/repo/pull/123 and review https://gitlab.example.com/grp/proj/-/merge_requests/9 please; no link here: not-a-pr",
+    );
+    expect(found).toEqual([
+      { url: "https://github.com/acme/repo/pull/123", number: 123, forge: "github" },
+      { url: "https://gitlab.example.com/grp/proj/-/merge_requests/9", number: 9, forge: "gitlab" },
+    ]);
+    expect(parsePrUrls("see https://codeberg.org/acme/repo/pulls/77")[0]?.forge).toBe("gitea");
+    expect(parsePrUrls("nothing pr-like")).toEqual([]);
+  });
+
+  it("parses forge CLI state output conservatively", () => {
+    expect(parseForgePrState("MERGED\n")).toBe("merged");
+    expect(parseForgePrState('{"state":"merged"}')).toBe("merged");
+    expect(parseForgePrState('{"state":"opened"}')).toBe("open");
+    expect(parseForgePrState('{"state":"canceled"}')).toBe("closed");
+    expect(parseForgePrState("State: closed")).toBe("closed");
+    expect(parseForgePrState("totally unrecognized output")).toBeNull();
+  });
+
+  it("pins and clears a rig forge via town_set_rig_forge, shaping sling briefs", async () => {
+    const { host, started } = await makeForgeHost();
+    await host.harness.behavior.callRpc("rigAdd", { projectId: "proj_rig" });
+
+    // Pin to tea: sling brief should carry the tea guidance.
+    const pinned = await host.harness.behavior.callAgentTool(
+      "town_set_rig_forge",
+      { projectId: "proj_rig", forge: "tea" },
+      { threadId: started.threadId },
+    );
+    expect(String(pinned)).toContain('set to tea');
+    await host.harness.behavior.callAgentTool(
+      "town_sling",
+      { title: "Pin check", mission: "Check the pin.", openPr: true, rigProjectId: "proj_rig" },
+      { threadId: started.threadId },
+    );
+    const spawns = host.harness.inspection.sdk.callsTo("threads.spawn");
+    const pinnedPrompt = String((spawns[spawns.length - 1]![0] as { prompt: string }).prompt);
+    expect(pinnedPrompt).toContain("tea");
+
+    // "none" pin: forge commands are forbidden in the brief.
+    await host.harness.behavior.callAgentTool(
+      "town_set_rig_forge",
+      { projectId: "proj_rig", forge: "none" },
+      { threadId: started.threadId },
+    );
+    await host.harness.behavior.callAgentTool(
+      "town_sling",
+      { title: "Pin check 2", mission: "Check opt-out.", openPr: true, rigProjectId: "proj_rig" },
+      { threadId: started.threadId },
+    );
+    const spawns2 = host.harness.inspection.sdk.callsTo("threads.spawn");
+    const nonePrompt = String((spawns2[spawns2.length - 1]![0] as { prompt: string }).prompt);
+    expect(nonePrompt).toContain("No forge CLI (gh/glab/gt/tea) is available");
+    expect(nonePrompt).not.toContain("gh pr create");
+
+    // "auto" clears the pin; unknown remote → degraded (no CLI detected) but no error.
+    const cleared = await host.harness.behavior.callAgentTool(
+      "town_set_rig_forge",
+      { projectId: "proj_rig", forge: "auto" },
+      { threadId: started.threadId },
+    );
+    expect(String(cleared)).toContain("set to auto");
+
+    // Alias: gitea normalizes to gt (the maintained Gitea CLI).
+    const aliased = await host.harness.behavior.callAgentTool(
+      "town_set_rig_forge",
+      { projectId: "proj_rig", forge: "gitea" },
+      { threadId: started.threadId },
+    );
+    expect(String(aliased)).toContain("set to gt");
+
+    // Rejects an unknown forge.
+    await expect(
+      host.harness.behavior.callAgentTool(
+        "town_set_rig_forge",
+        { projectId: "proj_rig", forge: "bitbucket" },
+        { threadId: started.threadId },
+      ),
+    ).rejects.toThrow(/Unknown forge/);
   });
 });

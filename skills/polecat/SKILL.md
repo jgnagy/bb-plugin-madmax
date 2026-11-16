@@ -19,6 +19,13 @@ without waiting for more instructions.
 - If your brief is a review task: check out and read the code you review.
   Do not change it. Do not post or approve anything. Follow the report
   format in your brief.
+- Review your own work before reporting it. When the work is done and
+  checked, call `polecat_request_review` (`lite` by default, `full` when the
+  work is risky or the owner asked). A reviewer works in your worktree and
+  reports findings to you. Fix what they confirm, commit, and request again
+  until the verdict is ship. Only then report ready — include the verdict.
+  If you and the reviewer disagree, say both sides plainly in a blocked
+  report; do not loop silently.
 - Commit messages, pull request text, and comments read like a normal
   engineer wrote them. Do not mention the town, the Mayor, polecats,
   beads, or internal ids — unless your brief says the vocabulary fits
@@ -43,5 +50,8 @@ memory, so say everything worth keeping in the report itself.
 - End every session with a final report — what you did, where (files/branch),
   how you verified it, and what is left or blocked. Put questions and
   decisions in the report plainly.
+- If your brief authorizes opening a PR: when you open it, put the full PR
+  URL in your report. The town watches it — when the forge reports it
+  merged, the bead closes and your thread is marked complete automatically.
 - If report delivery fails, the report stays queued for automatic retry;
   surface the delivery error rather than claiming the Mayor received it.
