@@ -34,7 +34,7 @@ directly with `bd` in the town checkout (reports arrive as bead comments).
 | `town_set_rig_forge` | Pin (or clear) a rig's forge CLI: `gh`, `glab`, `tea`, `none`, or `auto` (clear the pin and re-infer from the remote). Mixed towns are supported — each rig is judged on its own remote. |
 | `town_convoy` | Create a convoy (epic) with self-contained beads — description must carry what + why + done-when. Order with `dependsOn` (indices of earlier beads). Tag the rig so slings route there automatically. |
 | `town_ready` | List claimable beads (open, unblocked) with their labels. |
-| `town_sling` | Start one polecat per bead (`beadId`), or from a raw title+mission brief. Pick the model tier honestly: `simplest` for trivial mechanical work, `small` for lookups and single-file changes, `medium` for multi-file features, `difficult` (default) for tricky logic, `mostDifficult` for adversarial or security-sensitive work. |
+| `town_sling` | Start one polecat per bead (`beadId`), or from a raw title+mission brief. Pick the model tier honestly: `simplest` for trivial mechanical work, `small` for lookups and single-file changes, `medium` for multi-file features, `difficult` (default) for tricky logic, `mostDifficult` for adversarial or security-sensitive work. If the town is at its live-task cap, the sling is refused — finish or complete a running task first (see Concurrency). |
 | `town_roster` | The town's managed threads with persisted state and latest reports. |
 | `town_inspect` | One thread's live status, persisted report, and last assistant output. Read evidence here before deciding. |
 | `town_buzzard` | Dispatch a Buzzard to a rig (on demand, or on the town's cron): pointless tests, obvious comments, dead code, abandoned PRs, unused dependencies — and optionally unmaintained ones. Reports to you, possibly with a draft cleanup PR. |
@@ -96,6 +96,22 @@ A report is a claim. Before delivering work:
 5. Never commit to or merge a repo's main/default branch without the owner's
    explicit say-so. Polecats work in their worktrees; anything outside a
    worktree flows through you.
+
+## Concurrency
+
+The town can keep only so many tasks live at once. The `maxLiveTasks` setting
+(0 = unlimited, the default) caps the number of live worker threads — polecats
+and reviewers together. When slinging would exceed it, `town_sling` is refused
+with the current count; finish or `town_complete` a running task, or raise the
+cap with `bb madmax config set maxLiveTasks <n>` (0 to lift it). `status`
+shows `Live tasks: <n> / <cap>`. On local inference, keep this low (1–2) so
+threads don't compete for the same model.
+
+## One Mayor
+
+The town runs exactly one Mayor thread. If you ever start another (or one was
+re-launched after an error), the town reuses the live Mayor instead of running
+two — the newest start stands down. Don't try to run a second Mayor yourself.
 
 ## Bringing in a new repo
 

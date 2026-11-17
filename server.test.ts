@@ -1548,6 +1548,125 @@ describe.skipIf(!bdAvailable)("madmax ledger (real bd)", () => {
     for (const notice of reviewNotices) expect(notice.threadId).toBe(mayorId);
   });
 
+  it("reuses a live Mayor the DB has marked failed instead of spawning another", async () => {
+    const { host, mayorId } = await makeLedgerHost();
+    // A transport error can mark a live thread failed in the DB even though it
+    // is still running. The start flow must reconcile the latest Mayor against
+    // its live status and reuse it rather than spawn a duplicate.
+    host.bb.storage.database().prepare("UPDATE town_threads SET state='failed' WHERE thread_id=?").run(mayorId);
+    host.harness.inspection.sdk.stub("threads.get", (args: { threadId: string }) =>
+      makeThreadResponse({
+        id: args.threadId,
+        status: "active",
+        sectionId: "sec_town",
+        visibility: "visible",
+        title: "Mayor · MyTown",
+        deletedAt: null,
+        archivedAt: null,
+      }));
+    const again = (await host.harness.behavior.callRpc("start", { projectId: "proj_town" })) as {
+      threadId: string;
+      created: boolean;
+    };
+    expect(again.created).toBe(false);
+    expect(again.threadId).toBe(mayorId);
+    // No second Mayor thread was spawned.
+    expect(host.harness.inspection.sdk.callsTo("threads.spawn")).toHaveLength(1);
+  });
+
+  it("caps concurrent live tasks and refuses a sling at the limit", async () => {
+    const { host, dir, mayorId } = await makeLedgerHost();
+    await host.harness.behavior.setSettings({ maxLiveTasks: "1" });
+    // The first sling starts a worker and is allowed.
+    await host.harness.behavior.callAgentTool(
+      "town_sling",
+      { title: "First job", mission: "Do the first thing." },
+      { threadId: mayorId },
+    );
+    // A second sling is refused while the first is still live — at the cap.
+    await expect(
+      host.harness.behavior.callAgentTool(
+        "town_sling",
+        { title: "Second job", mission: "Do the second thing." },
+        { threadId: mayorId },
+      ),
+    ).rejects.toThrow(/cap/i);
+    // Only the Mayor + one worker were ever spawned — no stranded work.
+    expect(host.harness.inspection.sdk.callsTo("threads.spawn")).toHaveLength(2);
+    expect(await bdList(dir)).toHaveLength(1);
+  });
+
+  it("releases a cap slot when a live task finishes", async () => {
+    const { host, dir, mayorId } = await makeLedgerHost();
+    await host.harness.behavior.setSettings({ maxLiveTasks: "1" });
+    const polecatId = await slingFirstBead(host, dir, mayorId);
+    // Completing the worker frees its slot.
+    await host.harness.behavior.callAgentTool(
+      "town_complete",
+      { threadId: polecatId, result: "Done and verified." },
+      { threadId: mayorId },
+    );
+    // A new sling is allowed again once the slot is free.
+    await host.harness.behavior.callAgentTool(
+      "town_sling",
+      { title: "Next job", mission: "Do the next thing." },
+      { threadId: mayorId },
+    );
+    expect(host.harness.inspection.sdk.callsTo("threads.spawn")).toHaveLength(3);
+  });
+
+  it("reports live task counts and the cap in status", async () => {
+    const { host, mayorId } = await makeLedgerHost();
+    await host.harness.behavior.setSettings({ maxLiveTasks: "3" });
+    await host.harness.behavior.callAgentTool(
+      "town_sling",
+      { title: "A job", mission: "Do it." },
+      { threadId: mayorId },
+    );
+    const status = (await host.harness.behavior.callRpc("status", null)) as {
+      liveTasks: number;
+      maxLiveTasks: number;
+    };
+    expect(status.maxLiveTasks).toBe(3);
+    expect(status.liveTasks).toBe(1); // just the one worker — the Mayor is excluded
+  });
+
+  it("stands down a freshly-spawned Mayor when another Mayor is still alive", async () => {
+    const { host, mayorId } = await makeLedgerHost();
+    // mayorId (A) is the town's original, still-live Mayor. Insert a *newer*
+    // Mayor row that the live API reports as deleted, so ensureMayor can't
+    // reuse it and falls through to spawnMayor — whose backstop must then find
+    // the alive A and stand the freshly-spawned duplicate down.
+    const when = Date.now() + 1000;
+    host.bb.storage.database()
+      .prepare(
+        "INSERT INTO town_threads (thread_id, role, project_id, mayor_thread_id, worker_thread_id, bead_id, tier, title, state, status, active_since, active_cycle, stall_alerted_cycle, created_at, updated_at) " +
+          "VALUES (?, 'mayor', 'proj_town', NULL, NULL, NULL, NULL, 'Mayor · MyTown', 'starting', 'starting', NULL, 0, NULL, ?, ?)",
+      )
+      .run("thr_stale_mayor", when, when);
+    // Branch threads.get on threadId: the stale newest Mayor reads deleted,
+    // the original A stays alive.
+    host.harness.inspection.sdk.stub("threads.get", (args: { threadId: string }) =>
+      makeThreadResponse({
+        id: args.threadId,
+        status: "idle",
+        environmentId: "env_work_1",
+        ...(args.threadId === mayorId
+          ? { deletedAt: null, archivedAt: null }
+          : { deletedAt: "2026-01-01T00:00:00Z", archivedAt: null }),
+      }));
+    const spawnsBefore = host.harness.inspection.sdk.callsTo("threads.spawn").length;
+    const rerun = (await host.harness.behavior.callRpc("start", { projectId: "proj_town" })) as {
+      threadId: string;
+      created: boolean;
+    };
+    // The backstop fired: a duplicate WAS spawned, but the result keeps the
+    // alive original and reports it as reused (not created).
+    expect(host.harness.inspection.sdk.callsTo("threads.spawn")).toHaveLength(spawnsBefore + 1);
+    expect(rerun.created).toBe(false);
+    expect(rerun.threadId).toBe(mayorId);
+  });
+
 });
 
 describe("forge detection", () => {
