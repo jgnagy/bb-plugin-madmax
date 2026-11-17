@@ -568,6 +568,46 @@ describe("madmax town backend", () => {
     expect(status.mayor?.threadId).toBe(created.threadId);
   });
 
+  it("exposes the town's on-disk folder path in status and via the town command", async () => {
+    const host = await makeHost();
+    const townDir = join(tmpdir(), "madmax-town-folder");
+    // The shared startTown helper stubs projects.get without sources, so stub it
+    // here to surface the default source's path.
+    host.harness.inspection.sdk.stub("threadSections.list", () => []);
+    host.harness.inspection.sdk.stub("threadSections.create", () => ({ id: "sec_town", name: "Town" }));
+    host.harness.inspection.sdk.stub("hosts.list", () => [{ id: "host_1", status: "connected" }]);
+    host.harness.inspection.sdk.stub(
+      "projects.get",
+      (args: { projectId: string }) => ({
+        id: args.projectId,
+        name: "MyTown",
+        sources: [
+          { id: "src_1", projectId: args.projectId, hostId: "host_1", isDefault: true, path: townDir, type: "local_path" },
+        ],
+      }),
+    );
+    host.harness.inspection.sdk.stub("threads.spawn", () =>
+      makeThreadResponse({ id: "thr_townpath_mayor", status: "starting" }),
+    );
+    host.harness.inspection.sdk.stub("threads.send", () => ({ ok: true }));
+
+    await host.harness.behavior.callRpc("start", { projectId: "proj_town" });
+
+    const status = (await host.harness.behavior.callRpc("status", null)) as {
+      townProjectId: string | null;
+      townPath: string | null;
+    };
+    expect(status.townProjectId).toBe("proj_town");
+    expect(status.townPath).toBe(townDir);
+
+    const town = await host.harness.behavior.runCli(["town"]);
+    expect(town.exitCode).toBe(0);
+    expect(town.stdout.trim()).toBe(townDir);
+
+    const townJson = await host.harness.behavior.runCli(["town", "--json"]);
+    expect(JSON.parse(townJson.stdout)).toEqual({ path: townDir });
+  });
+
   it("browseTownDirectories lists only directories from the host", async () => {
     const host = await makeHost();
     host.harness.inspection.sdk.stub("hosts.list", () => [{ id: "host_1", status: "connected" }]);
