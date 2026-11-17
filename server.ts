@@ -102,6 +102,12 @@ export function looksLikeGiteaCli(versionOutput: string): boolean {
   return /gitea/i.test(versionOutput);
 }
 
+/** Parse the maxLiveTasks setting: a positive integer cap, or 0 for unlimited. */
+export function parseMaxLiveTasks(value: string | null | undefined): number {
+  const parsed = Number(value);
+  return Number.isFinite(parsed) && parsed > 0 ? Math.floor(parsed) : 0;
+}
+
 const FORGE_ALIASES: Record<string, string> = {
   github: "gh",
   gitlab: "glab",
@@ -319,6 +325,8 @@ const statusOutputSchema = z.object({
   townProjectId: z.string().nullable(),
   mayor: managedThreadSchema.nullable(),
   threads: z.array(managedThreadSchema),
+  liveTasks: z.number(),
+  maxLiveTasks: z.number(),
   rigs: z.array(rigSchema),
   ledger: z
     .object({
@@ -547,6 +555,11 @@ export default async function plugin(bb: BbPluginApi) {
       default: "accept-edits",
     },
     stallMinutes: { type: "string", label: "Stall threshold (minutes)", default: "30" },
+    maxLiveTasks: {
+      type: "string",
+      label: "Max concurrent live tasks in the town (0 = unlimited)",
+      default: "0",
+    },
     mergeWatch: {
       type: "boolean",
       label: "Close out merged PRs automatically (bead closed, thread completed and archived once no reviewer is still running)",
@@ -672,6 +685,9 @@ export default async function plugin(bb: BbPluginApi) {
   const latestMayor = db.prepare(
     `SELECT * FROM town_threads WHERE role='mayor' ORDER BY created_at DESC LIMIT 1`,
   );
+  const allMayors = db.prepare(
+    `SELECT * FROM town_threads WHERE role='mayor' ORDER BY created_at DESC`,
+  );
   const allRigs = db.prepare(`SELECT * FROM rigs ORDER BY registered_at ASC`);
   const rigById = db.prepare<[string]>(`SELECT * FROM rigs WHERE project_id=?`);
   const pendingAlerts = db.prepare(
@@ -687,6 +703,21 @@ export default async function plugin(bb: BbPluginApi) {
     roles = new Map((allRows.all() as ManagedRow[]).map((row) => [row.thread_id, row]));
   }
   reloadRoles();
+
+  /**
+   * How many worker threads are still live — any role except Mayor whose state
+   * is not yet terminal (complete/archived/deleted). Reviewers count too, since
+   * they consume resources. Used to enforce the maxLiveTasks concurrency cap.
+   */
+  function countLiveTasks(): number {
+    let count = 0;
+    for (const row of roles.values()) {
+      if (row.role === "mayor") continue;
+      if (["complete", "archived", "deleted"].includes(row.state)) continue;
+      count += 1;
+    }
+    return count;
+  }
 
   function publishTown() {
     bb.realtime.publish(REALTIME_CHANNEL, null);
@@ -1330,6 +1361,37 @@ export default async function plugin(bb: BbPluginApi) {
     }
     insertThread({ threadId: thread.id, role: "mayor", projectId: target, title, state: "starting", status: thread.status });
     logEvent("mayor", `Mayor started: ${title}`, thread.id);
+    // Backstop against duplicate Mayors: the reconcile above usually catches a
+    // live-but-terminal-in-the-DB Mayor and reuses it, but a genuine race (or
+    // an older Mayor the latest one doesn't cover) can still spawn a second.
+    // Verify no *other* Mayor is actually alive; if one is, nudge it and stand
+    // this duplicate down rather than run two Mayors at once.
+    const others = (allMayors.all() as ManagedRow[]).filter((row) => row.role === "mayor" && row.thread_id !== thread.id);
+    for (const other of others) {
+      let live: { deletedAt?: string | null; archivedAt?: string | null } | null = null;
+      try {
+        live = (await bb.sdk.threads.get({ threadId: other.thread_id })) as { deletedAt?: string | null; archivedAt?: string | null } | null;
+      } catch {
+        continue;
+      }
+      if (!live || live.deletedAt !== null || live.archivedAt !== null) continue;
+      try {
+        await bb.sdk.threads.send({
+          threadId: other.thread_id,
+          mode: "queue-if-active",
+          input: [{ type: "text", text: clip(`A second Mayor thread (${thread.id}) was just started and is standing down — you are the town's only Mayor now. Ignore the duplicate and keep coordinating.`, MAX_RESULT_LENGTH), mentions: [] }],
+          senderThreadId: thread.id,
+        });
+      } catch {
+        /* best effort — the duplicate stands down regardless */
+      }
+      const now = Date.now();
+      db.prepare(`UPDATE town_threads SET state='complete', updated_at=? WHERE thread_id=?`).run(now, thread.id);
+      reloadRoles();
+      publishTown();
+      logEvent("mayor", `Duplicate Mayor ${thread.id} stood down; keeping ${other.thread_id}`, other.thread_id);
+      return { threadId: other.thread_id, created: false as const };
+    }
     return { threadId: thread.id, created: true as const };
   }
 
@@ -1340,12 +1402,16 @@ export default async function plugin(bb: BbPluginApi) {
     const inFlight = mayorStarts.get(target);
     if (inFlight) return inFlight;
     const start = (async () => {
-      const existing = mayorRow();
-      if (existing && existing.project_id === target) {
-        await reconcileThread(existing, await ensureSection());
-        const reconciled = roles.get(existing.thread_id);
+      // Reconcile the LATEST Mayor against its live status before deciding to
+      // spawn — even when the DB marks it terminal. A transport error can mark
+      // a live thread failed, and reusing the live Mayor avoids spawning a
+      // duplicate. Only the latest Mayor matters; older ones are retired.
+      const latest = latestMayor.get() as ManagedRow | undefined;
+      if (latest && latest.project_id === target) {
+        await reconcileThread(latest, await ensureSection());
+        const reconciled = roles.get(latest.thread_id);
         if (reconciled && !["failed", "deleted", "archived", "complete"].includes(reconciled.state)) {
-          return { threadId: existing.thread_id, created: false };
+          return { threadId: reconciled.thread_id, created: false };
         }
       }
       const previous = latestMayor.get() as ManagedRow | undefined;
@@ -1548,6 +1614,20 @@ export default async function plugin(bb: BbPluginApi) {
     }
     const townId = mayor.project_id || townProject;
     if (!townId) throw new Error("No town project is configured.");
+
+    // Concurrency cap: refuse to start a new worker when the town is already
+    // running as many live tasks as maxLiveTasks allows. Checked here — before
+    // any bead is filed — so a rejected sling leaves no stranded bead behind.
+    const cap = parseMaxLiveTasks(values.maxLiveTasks);
+    if (cap > 0) {
+      const live = countLiveTasks();
+      if (live >= cap) {
+        throw new Error(
+          `The town already has ${live} live task${live === 1 ? "" : "s"} running, at the cap of ${cap}. ` +
+          `Wait for one to finish, or raise the cap: bb plugin config madmax set maxLiveTasks <n>.`,
+        );
+      }
+    }
 
     // A bead carries its own brief; otherwise the caller must supply one.
     let bead: Bead | null = null;
@@ -2966,6 +3046,8 @@ export default async function plugin(bb: BbPluginApi) {
       townProjectId: await configuredTownProject(),
       mayor: mayor ? toManaged(mayor) : null,
       threads: [...roles.values()].map(toManaged),
+      liveTasks: countLiveTasks(),
+      maxLiveTasks: parseMaxLiveTasks((await settings.get()).maxLiveTasks),
       rigs: (allRigs.all() as RigRow[]).map((row) => ({ projectId: row.project_id, name: row.name, forge: row.forge ?? null, registeredAt: row.registered_at })),
       ledger: await ledgerBlock(),
     };
@@ -3501,6 +3583,9 @@ export default async function plugin(bb: BbPluginApi) {
                   : "No town yet. Run: bb madmax init",
               ...status.threads.filter((thread) => thread.role !== "mayor").map((thread) => `${thread.role.padEnd(8)} ${thread.state.padEnd(9)} ${thread.title}  ${thread.threadId}`),
               ...(status.rigs.length ? [`Rigs: ${status.rigs.map((rig) => rig.name).join(", ")}`] : []),
+              status.maxLiveTasks > 0
+                ? `Live tasks: ${status.liveTasks} / ${status.maxLiveTasks} (cap)`
+                : `Live tasks: ${status.liveTasks} (no cap)`,
               ...ledgerLines,
             ].join("\n"),
           );
