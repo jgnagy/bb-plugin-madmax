@@ -323,6 +323,7 @@ export type TownEvent = z.infer<typeof townEventSchema>;
 const statusOutputSchema = z.object({
   sectionId: z.string().nullable(),
   townProjectId: z.string().nullable(),
+  townPath: z.string().nullable(),
   mayor: managedThreadSchema.nullable(),
   threads: z.array(managedThreadSchema),
   liveTasks: z.number(),
@@ -3044,6 +3045,7 @@ export default async function plugin(bb: BbPluginApi) {
     return {
       sectionId: storedSectionId(),
       townProjectId: await configuredTownProject(),
+      townPath: (await townSource())?.path ?? null,
       mayor: mayor ? toManaged(mayor) : null,
       threads: [...roles.values()].map(toManaged),
       liveTasks: countLiveTasks(),
@@ -3541,6 +3543,7 @@ export default async function plugin(bb: BbPluginApi) {
     summary: "Run the town: a Mayor that slings work to polecat threads across rigs",
     commands: [
       { name: "status", summary: "Show the town's roster", usage: "bb madmax status [--json]" },
+      { name: "town", summary: "Print the town's folder path on disk", usage: "bb madmax town [--json]" },
       { name: "start", summary: "Start or return the town's Mayor", usage: "bb madmax start [--project <proj-id>] [--json]" },
       { name: "init", summary: "Choose the town project (existing or a new folder) and start the Mayor", usage: "bb madmax init --project <proj-id> | --path <dir> --name <name> [--host <host-id>]" },
       { name: "ledger", summary: "Initialize or inspect the town's Beads ledger", usage: "bb madmax ledger init|status [--json]" },
@@ -3581,6 +3584,7 @@ export default async function plugin(bb: BbPluginApi) {
                 : status.townProjectId
                   ? `Town: ${status.townProjectId} — no Mayor yet. Run: bb madmax start`
                   : "No town yet. Run: bb madmax init",
+              ...(status.townPath ? [`Town folder: ${status.townPath}`] : []),
               ...status.threads.filter((thread) => thread.role !== "mayor").map((thread) => `${thread.role.padEnd(8)} ${thread.state.padEnd(9)} ${thread.title}  ${thread.threadId}`),
               ...(status.rigs.length ? [`Rigs: ${status.rigs.map((rig) => rig.name).join(", ")}`] : []),
               status.maxLiveTasks > 0
@@ -3589,6 +3593,11 @@ export default async function plugin(bb: BbPluginApi) {
               ...ledgerLines,
             ].join("\n"),
           );
+        }
+        if (command === "town") {
+          const path = (await townSource())?.path;
+          if (!path) return fail("No town folder configured.");
+          return ok({ path }, path);
         }
         if (command === "start") {
           const result = await ensureMayor(args.one("project") ?? context.projectId ?? undefined);
