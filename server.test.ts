@@ -1707,6 +1707,62 @@ describe.skipIf(!bdAvailable)("madmax ledger (real bd)", () => {
     expect(rerun.threadId).toBe(mayorId);
   });
 
+  it("archives the duplicate thread when the backstop stands it down", async () => {
+    const { host, mayorId } = await makeLedgerHost();
+    // The original Mayor (mayorId) is still live. A newer, terminal Mayor row
+    // forces ensureMayor to spawn a duplicate instead of reusing the original —
+    // and the backstop must then stand the duplicate down by ARCHIVING its
+    // thread, not merely marking its DB row complete. A later thread.idle would
+    // otherwise flip that complete back to idle and revive a second Mayor.
+    const when = Date.now() + 1000;
+    host.bb.storage.database()
+      .prepare(
+        "INSERT INTO town_threads (thread_id, role, project_id, mayor_thread_id, worker_thread_id, bead_id, tier, title, state, status, active_since, active_cycle, stall_alerted_cycle, created_at, updated_at) " +
+          "VALUES (?, 'mayor', 'proj_town', NULL, NULL, NULL, NULL, 'Mayor · MyTown', 'starting', 'starting', NULL, 0, NULL, ?, ?)",
+      )
+      .run("thr_stale_mayor", when, when);
+    // The original Mayor stays alive; the stale newest reads deleted, so the
+    // start flow spawns a duplicate rather than reusing the original.
+    host.harness.inspection.sdk.stub("threads.get", (args: { threadId: string }) =>
+      makeThreadResponse({
+        id: args.threadId,
+        status: "idle",
+        environmentId: "env_work_1",
+        ...(args.threadId === mayorId
+          ? { deletedAt: null, archivedAt: null }
+          : { deletedAt: "2026-01-01T00:00:00Z", archivedAt: null }),
+      }));
+    // Capture the id the duplicate spawn returns so we can assert the archive
+    // targeted exactly that thread.
+    let spawnedDup: string | undefined;
+    host.harness.inspection.sdk.stub("threads.spawn", () => {
+      const thread = makeThreadResponse({ id: "thr_duplicate", status: "starting" });
+      spawnedDup = thread.id;
+      return thread;
+    });
+    const rerun = (await host.harness.behavior.callRpc("start", { projectId: "proj_town" })) as {
+      threadId: string;
+      created: boolean;
+    };
+    // The backstop fired: a duplicate was spawned and stood down — the survivor
+    // is returned, not the duplicate.
+    expect(rerun.created).toBe(false);
+    expect(rerun.threadId).toBe(mayorId);
+    expect(spawnedDup).toBeDefined();
+    // The duplicate's thread was archived — not just DB-marked complete — so a
+    // later thread.idle can't revive it as a second Mayor.
+    const archives = host.harness.inspection.sdk.callsTo("threads.archive") as [{ threadId: string }][];
+    expect(archives.some((call) => call[0].threadId === spawnedDup)).toBe(true);
+    expect(archives.some((call) => call[0].threadId === mayorId)).toBe(false);
+    // The survivor was nudged to stand the duplicate down.
+    const sends = host.harness.inspection.sdk.callsTo("threads.send") as [{ threadId: string; input?: unknown }][];
+    expect(
+      sends.some(
+        (call) => call[0].threadId === mayorId && JSON.stringify(call[0].input ?? null).includes("standing down"),
+      ),
+    ).toBe(true);
+  });
+
 });
 
 describe("forge detection", () => {
