@@ -687,7 +687,7 @@ export default async function plugin(bb: BbPluginApi) {
     `SELECT * FROM town_threads WHERE role='mayor' ORDER BY created_at DESC LIMIT 1`,
   );
   const allMayors = db.prepare(
-    `SELECT * FROM town_threads WHERE role='mayor' ORDER BY created_at DESC`,
+    `SELECT * FROM town_threads WHERE role='mayor' AND state NOT IN ('complete','archived','deleted') ORDER BY created_at DESC`,
   );
   const allRigs = db.prepare(`SELECT * FROM rigs ORDER BY registered_at ASC`);
   const rigById = db.prepare<[string]>(`SELECT * FROM rigs WHERE project_id=?`);
@@ -1391,6 +1391,13 @@ export default async function plugin(bb: BbPluginApi) {
       reloadRoles();
       publishTown();
       logEvent("mayor", `Duplicate Mayor ${thread.id} stood down; keeping ${other.thread_id}`, other.thread_id);
+      try {
+        await bb.sdk.threads.archive({ threadId: thread.id });
+      } catch (error) {
+        // best effort: the DB row is already marked complete and excluded from
+        // the Mayor query, so a failed archive still stands the duplicate down.
+        bb.log.warn(`Could not archive duplicate Mayor ${thread.id}: ${String(error)}`);
+      }
       return { threadId: other.thread_id, created: false as const };
     }
     return { threadId: thread.id, created: true as const };
