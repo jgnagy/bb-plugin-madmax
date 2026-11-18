@@ -2997,8 +2997,9 @@ export default async function plugin(bb: BbPluginApi) {
               ].join("\n")).catch(() => false);
             }
           }
-          const mayorTerminal =
-            [...roles.values()].some((row) => row.role === "mayor" && ["failed", "archived", "deleted"].includes(row.state));
+          const anyLiveMayor =
+            [...roles.values()].some((row) => row.role === "mayor" && !["failed", "archived", "deleted"].includes(row.state));
+          const mayorTerminal = !anyLiveMayor;
           if (mayorTerminal && ((await settings.get()).townProject as string | null)) {
             await ensureMayor();
           }
