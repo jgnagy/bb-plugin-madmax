@@ -438,6 +438,10 @@ export const rpcContract = defineRpcContract({
     input: z.object({ threadId: z.string().trim().min(1), text: z.string().trim().min(1).max(MAX_RESULT_LENGTH) }).strict(),
     output: z.object({ threadId: z.string() }).strict(),
   },
+  townRelaunch: {
+    input: z.object({ threadId: z.string().trim().min(1), note: z.string().trim().max(MAX_RESULT_LENGTH).optional() }).strict(),
+    output: z.object({ oldThreadId: z.string(), threadId: z.string() }).strict(),
+  },
 });
 
 interface ManagedRow {
@@ -1900,6 +1904,31 @@ export default async function plugin(bb: BbPluginApi) {
     });
     logEvent("note", `Note to the Mayor about “${row.title}”`, threadId);
     return { threadId };
+  }
+
+  /**
+   * Relaunch a worker: a fresh polecat picks up the worker's bead again. The
+   * bead is reopened and re-claimed, and the note (if any) tells the new worker
+   * what to focus on. Only the task carries over — the old worker's conversation
+   * is left behind. Refused while the worker is still running, so a relaunch
+   * never doubles up a live task.
+   */
+  async function relaunchWorker(threadId: string, note?: string) {
+    const row = requireWorker(threadId);
+    if (!["complete", "archived", "deleted"].includes(row.state)) {
+      throw new Error("Relaunch a worker only once it has ended (complete or archived), not while it is still running.");
+    }
+    const beadId = row.bead_id;
+    if (!beadId) throw new Error("This worker has no ledger bead to relaunch from.");
+    try {
+      await runBd(["reopen", beadId]);
+      invalidateLedger();
+    } catch {
+      /* the bead may already be open — sling re-claims it regardless */
+    }
+    const result = await sling({ beadId, context: note ? `Relaunched: ${note}` : undefined }, null);
+    logEvent("relaunch", `Relaunched “${row.title}” (bead ${beadId})`, result.threadId, beadId);
+    return { oldThreadId: threadId, threadId: result.threadId };
   }
 
   function enqueueAlert(row: ManagedRow, key: string, message: string, targetOverride?: string) {
@@ -3607,6 +3636,7 @@ export default async function plugin(bb: BbPluginApi) {
     townInterrupt: ({ threadId }) => interruptWorker(threadId),
     townEnd: ({ threadId, confirmed }) => endWorker(threadId, confirmed ?? false),
     townNote: ({ threadId, text }) => noteToMayor(threadId, text),
+    townRelaunch: ({ threadId, note }) => relaunchWorker(threadId, note),
   });
 
   const usage = [
@@ -3628,6 +3658,7 @@ export default async function plugin(bb: BbPluginApi) {
     "  bb madmax interrupt <thread-id> [--json]",
     "  bb madmax end <thread-id> [--confirmed] [--json]",
     "  bb madmax note <thread-id> --text \"…\" [--json]",
+    "  bb madmax relaunch <thread-id> [--note \"…\"] [--json]",
     "  bb madmax inspect <thread-id>",
     "  bb madmax review <thread-id> [--focus \"…\"] [--mode lite|full] [--json]",
     "  bb madmax verify <thread-id>",
@@ -3656,6 +3687,7 @@ export default async function plugin(bb: BbPluginApi) {
       { name: "interrupt", summary: "Stop a worker's running turn", usage: "bb madmax interrupt <thread-id> [--json]" },
       { name: "end", summary: "End a worker and archive its worktree", usage: "bb madmax end <thread-id> [--confirmed] [--json]" },
       { name: "note", summary: "Leave a note about a worker for the Mayor", usage: "bb madmax note <thread-id> --text \"…\" [--json]" },
+      { name: "relaunch", summary: "Relaunch a worker from its bead", usage: "bb madmax relaunch <thread-id> [--note \"…\"] [--json]" },
       { name: "inspect", summary: "Inspect a managed thread's evidence", usage: "bb madmax inspect <thread-id>" },
       { name: "review", summary: "Start an adversarial review of an idle polecat's work", usage: "bb madmax review <thread-id> [--focus \"…\"] [--mode lite|full] [--json]" },
       { name: "verify", summary: "Gather git evidence from a managed thread's worktree", usage: "bb madmax verify <thread-id>" },
@@ -3839,6 +3871,12 @@ export default async function plugin(bb: BbPluginApi) {
           if (!threadId || !text) return fail("note requires <thread-id> and --text");
           await noteToMayor(threadId, text);
           return ok({ threadId }, `Note delivered to the Mayor about ${threadId}.`);
+        }
+        if (command === "relaunch") {
+          const threadId = args.positional[0];
+          if (!threadId) return fail("relaunch requires <thread-id>");
+          const result = await relaunchWorker(threadId, args.one("note"));
+          return ok(result, `Relaunched ${result.oldThreadId} → ${result.threadId}.`);
         }
         if (command === "review") {
           const threadId = args.positional[0];

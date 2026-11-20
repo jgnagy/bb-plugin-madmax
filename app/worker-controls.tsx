@@ -111,6 +111,18 @@ export function WorkerControls({ threadId }: { threadId: string }) {
       .finally(() => setBusy(false));
   }
 
+  function relaunch(): void {
+    if (busy) return;
+    setBusy(true);
+    rpc
+      .call("townRelaunch", { threadId })
+      .then((result) => {
+        toast.success(`Relaunched as a new worker: ${result.threadId}`);
+      })
+      .catch((cause) => toast.error(cause instanceof Error ? cause.message : String(cause)))
+      .finally(() => setBusy(false));
+  }
+
   return (
     <div className="flex flex-col gap-1.5 pt-1">
       <div className="flex flex-wrap gap-1.5">
@@ -125,6 +137,9 @@ export function WorkerControls({ threadId }: { threadId: string }) {
         </Button>
         <Button size="sm" variant="outline" className="text-destructive" disabled={busy} onClick={() => end(false)}>
           <Icon name="Archive" className="size-3" /> End
+        </Button>
+        <Button size="sm" variant="outline" disabled={busy} onClick={relaunch}>
+          <Icon name="RotateCw" className="size-3" /> Relaunch
         </Button>
       </div>
       {steerOpen ? (

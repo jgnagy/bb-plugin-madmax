@@ -2001,6 +2001,13 @@ describe("worker controls (townNudge / townInterrupt / townEnd)", () => {
     expect(status.threads.find((thread) => thread.threadId === polecatId)?.state).toBe("archived");
   });
 
+  it("townRelaunch refuses a worker that is still running", async () => {
+    const { host, polecatId } = await makeWorkerHost();
+    await expect(
+      host.harness.behavior.callRpc("townRelaunch", { threadId: polecatId }),
+    ).rejects.toThrow(/only once it has ended/);
+  });
+
   it("townNote delivers a note about the worker to the Mayor", async () => {
     const { host, mayorId, polecatId } = await makeWorkerHost();
     const result = await host.harness.behavior.callRpc("townNote", { threadId: polecatId, text: "Watch the totals." });
