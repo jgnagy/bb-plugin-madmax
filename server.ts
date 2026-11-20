@@ -416,6 +416,24 @@ export const rpcContract = defineRpcContract({
       events: z.array(townEventSchema),
     }),
   },
+  townNudge: {
+    input: z
+      .object({
+        threadId: z.string().trim().min(1),
+        text: z.string().trim().min(1).max(MAX_RESULT_LENGTH),
+        steer: z.boolean().optional().describe("Interrupt the running turn instead of queuing behind it."),
+      })
+      .strict(),
+    output: z.object({ threadId: z.string(), steered: z.boolean() }).strict(),
+  },
+  townInterrupt: {
+    input: z.object({ threadId: z.string().trim().min(1) }).strict(),
+    output: z.object({ threadId: z.string(), stopped: z.boolean() }).strict(),
+  },
+  townEnd: {
+    input: z.object({ threadId: z.string().trim().min(1), confirmed: z.boolean().optional() }).strict(),
+    output: z.object({ threadId: z.string(), ended: z.boolean(), needsConfirmation: z.boolean() }).strict(),
+  },
 });
 
 interface ManagedRow {
@@ -1792,9 +1810,15 @@ export default async function plugin(bb: BbPluginApi) {
     return { threadId: thread.id, title, projectId: rigProjectId, tier, beadId: bead?.id ?? null };
   }
 
-  async function nudge(threadId: string, text: string, steer = false, authorizeEdits = false) {
+  /** A managed worker thread (any role but Mayor); throws for anything else. */
+  function requireWorker(threadId: string): ManagedRow {
     const row = roles.get(threadId);
     if (!row || row.role === "mayor") throw new Error(`No managed polecat or reviewer ${threadId}.`);
+    return row;
+  }
+
+  async function nudge(threadId: string, text: string, steer = false, authorizeEdits = false) {
+    const row = requireWorker(threadId);
     const payload =
       row.role === "reviewer"
         ? authorizeEdits
@@ -1815,6 +1839,47 @@ export default async function plugin(bb: BbPluginApi) {
     reloadRoles();
     publishTown();
     return roles.get(threadId)!;
+  }
+
+  /**
+   * Stop a worker's running turn, releasing its runtime. Reports whether the
+   * thread was actually busy — a stop on an idle thread is a no-op.
+   */
+  async function interruptWorker(threadId: string) {
+    const row = requireWorker(threadId);
+    const live = await bb.sdk.threads.get({ threadId });
+    const wasBusy = BUSY_STATUSES.has(live.status);
+    await bb.sdk.threads.stop({ threadId });
+    logEvent("interrupt", `Interrupted “${row.title}”${wasBusy ? "" : " (it was not running a turn)"}`, threadId);
+    reloadRoles();
+    publishTown();
+    return { threadId, stopped: wasBusy };
+  }
+
+  /**
+   * End a worker: archive its thread and its worktree. A worker with open work
+   * (any non-terminal state) is only ended once you confirm, so nothing
+   * live is dropped on a first press — uncommitted work is lost either way.
+   */
+  async function endWorker(threadId: string, confirmed: boolean) {
+    const row = requireWorker(threadId);
+    const hasOpenWork = !["complete", "archived", "deleted"].includes(row.state);
+    if (hasOpenWork && !confirmed) {
+      return { threadId, ended: false, needsConfirmation: true };
+    }
+    try {
+      await bb.sdk.threads.archive({ threadId });
+    } catch (error) {
+      // Best effort, as in complete(): the DB row below stands the worker down
+      // regardless, so it leaves the board even if the archive itself fails.
+      bb.log.warn(`Could not archive worker ${threadId}: ${String(error)}`);
+    }
+    const now = Date.now();
+    db.prepare(`UPDATE town_threads SET state='archived', updated_at=? WHERE thread_id=?`).run(now, threadId);
+    reloadRoles();
+    publishTown();
+    logEvent("end", `Ended “${row.title}”`, threadId);
+    return { threadId, ended: true, needsConfirmation: false };
   }
 
   function enqueueAlert(row: ManagedRow, key: string, message: string, targetOverride?: string) {
@@ -3515,6 +3580,12 @@ export default async function plugin(bb: BbPluginApi) {
         directories,
       };
     },
+    townNudge: async ({ threadId, text, steer }) => {
+      await nudge(threadId, text, steer);
+      return { threadId, steered: Boolean(steer) };
+    },
+    townInterrupt: ({ threadId }) => interruptWorker(threadId),
+    townEnd: ({ threadId, confirmed }) => endWorker(threadId, confirmed ?? false),
   });
 
   const usage = [
@@ -3533,6 +3604,8 @@ export default async function plugin(bb: BbPluginApi) {
     "  bb madmax sling --bead <bead-id> [--rig <project-id>] [--tier <tier>] [--json]",
     "  bb madmax sling --title \"…\" --mission \"…\" [--criteria \"…\"]... [--constraint \"…\"]... [--context \"…\"] [--rig <project-id>] [--tier <tier>] [--json]",
     "  bb madmax nudge <thread-id> --text \"…\" [--steer] [--authorize-edits] [--json]",
+    "  bb madmax interrupt <thread-id> [--json]",
+    "  bb madmax end <thread-id> [--confirmed] [--json]",
     "  bb madmax inspect <thread-id>",
     "  bb madmax review <thread-id> [--focus \"…\"] [--mode lite|full] [--json]",
     "  bb madmax verify <thread-id>",
@@ -3558,6 +3631,8 @@ export default async function plugin(bb: BbPluginApi) {
       { name: "rig", summary: "Manage registered rig projects", usage: "bb madmax rig list|add|remove|clone" },
       { name: "sling", summary: "Sling a work item to a polecat", usage: "bb madmax sling --title \"…\" --mission \"…\" [--rig <project-id>] [--tier <tier>] [--json]" },
       { name: "nudge", summary: "Nudge a managed polecat", usage: "bb madmax nudge <thread-id> --text \"…\" [--steer] [--authorize-edits] [--json]" },
+      { name: "interrupt", summary: "Stop a worker's running turn", usage: "bb madmax interrupt <thread-id> [--json]" },
+      { name: "end", summary: "End a worker and archive its worktree", usage: "bb madmax end <thread-id> [--confirmed] [--json]" },
       { name: "inspect", summary: "Inspect a managed thread's evidence", usage: "bb madmax inspect <thread-id>" },
       { name: "review", summary: "Start an adversarial review of an idle polecat's work", usage: "bb madmax review <thread-id> [--focus \"…\"] [--mode lite|full] [--json]" },
       { name: "verify", summary: "Gather git evidence from a managed thread's worktree", usage: "bb madmax verify <thread-id>" },
@@ -3722,6 +3797,18 @@ export default async function plugin(bb: BbPluginApi) {
           if (!threadId || !text) return fail("nudge requires <thread-id> and --text");
           await nudge(threadId, text, args.bool("steer"), args.bool("authorize-edits"));
           return ok({ threadId }, `Nudged ${threadId}.`);
+        }
+        if (command === "interrupt") {
+          const threadId = args.positional[0];
+          if (!threadId) return fail("interrupt requires <thread-id>");
+          const result = await interruptWorker(threadId);
+          return ok(result, `Interrupted ${result.threadId}${result.stopped ? "" : " (it was not running a turn)"}.`);
+        }
+        if (command === "end") {
+          const threadId = args.positional[0];
+          if (!threadId) return fail("end requires <thread-id>");
+          const result = await endWorker(threadId, args.bool("confirmed"));
+          return ok(result, result.needsConfirmation ? `End ${result.threadId} confirmed? (uncommitted work is lost)` : `Ended ${result.threadId}.`);
         }
         if (command === "review") {
           const threadId = args.positional[0];

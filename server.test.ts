@@ -1918,3 +1918,86 @@ describe("forge detection", () => {
     ).rejects.toThrow(/Unknown forge/);
   });
 });
+
+describe("worker controls (townNudge / townInterrupt / townEnd)", () => {
+  const hosts: Host["host"][] = [];
+
+  afterEach(async () => {
+    for (const host of hosts.splice(0)) await host.harness.lifecycle.dispose();
+  });
+
+  /** A town with one slung polecat; returns the mayor and polecat thread ids. */
+  async function makeWorkerHost() {
+    const host = createFakePluginHost({ pluginId: "madmax", agentSkillIds: ["mayor", "polecat"] });
+    hosts.push(host);
+    await plugin(host.bb);
+    host.harness.inspection.sdk.stub("threadSections.list", () => []);
+    host.harness.inspection.sdk.stub("threadSections.create", () => ({ id: "sec_town", name: "Town" }));
+    host.harness.inspection.sdk.stub("hosts.list", () => [{ id: "host_1", status: "connected" }]);
+    host.harness.inspection.sdk.stub("threads.send", () => ({ ok: true }));
+    host.harness.inspection.sdk.stub("threads.stop", () => ({ ok: true }));
+    host.harness.inspection.sdk.stub("threads.archive", () => ({ ok: true }));
+    host.harness.inspection.sdk.stub("threads.get", () => ({ status: "active", deletedAt: null, archivedAt: null }));
+    let counter = 0;
+    const spawned: string[] = [];
+    host.harness.inspection.sdk.stub("threads.spawn", () => {
+      const thread = makeThreadResponse({ id: `thr_worker_${counter++}`, status: "starting" });
+      spawned.push(thread.id);
+      return thread;
+    });
+    const started = await host.harness.behavior.callRpc("start", { projectId: "proj_town" });
+    await host.harness.behavior.callAgentTool(
+      "town_sling",
+      { title: "Fix the cart", mission: "Fix the cart total bug." },
+      { threadId: started.threadId },
+    );
+    return { host, mayorId: started.threadId, polecatId: spawned[1]! };
+  }
+
+  it("townNudge queues behind the turn, or steers it when asked", async () => {
+    const { host, mayorId, polecatId } = await makeWorkerHost();
+    await host.harness.behavior.callRpc("townNudge", { threadId: polecatId, text: "Slow down." });
+    const queued = host.harness.inspection.sdk.callsTo("threads.send");
+    const toPolecat = queued.filter((call) => (call[0] as { threadId: string }).threadId === polecatId);
+    expect(toPolecat).toHaveLength(1);
+    expect(toPolecat[0]![0] as { mode: string }).toMatchObject({ mode: "queue-if-active" });
+
+    await host.harness.behavior.callRpc("townNudge", { threadId: polecatId, text: "Steer now.", steer: true });
+    const steered = host.harness.inspection.sdk.callsTo("threads.send").filter(
+      (call) => (call[0] as { threadId: string }).threadId === polecatId,
+    );
+    expect(steered).toHaveLength(2);
+    expect(steered[1]![0] as { mode: string }).toMatchObject({ mode: "steer-if-active" });
+    expect(steered[1]![0] as { input: { type: string; text: string }[] }).toMatchObject({
+      input: [{ type: "text", text: "Steer now." }],
+    });
+    await expect(
+      host.harness.behavior.callRpc("townNudge", { threadId: mayorId, text: "no" }),
+    ).rejects.toThrow(/No managed polecat/);
+  });
+
+  it("townInterrupt stops the running turn", async () => {
+    const { host, polecatId } = await makeWorkerHost();
+    const result = await host.harness.behavior.callRpc("townInterrupt", { threadId: polecatId });
+    expect(result).toMatchObject({ threadId: polecatId });
+    const stops = host.harness.inspection.sdk.callsTo("threads.stop");
+    expect(stops.some((call) => (call[0] as { threadId: string }).threadId === polecatId)).toBe(true);
+  });
+
+  it("townEnd asks to confirm when the worker still has open work, then ends it", async () => {
+    const { host, polecatId } = await makeWorkerHost();
+    const first = await host.harness.behavior.callRpc("townEnd", { threadId: polecatId });
+    expect(first).toMatchObject({ ended: false, needsConfirmation: true });
+    expect(host.harness.inspection.sdk.callsTo("threads.archive")).toHaveLength(0);
+
+    const second = await host.harness.behavior.callRpc("townEnd", { threadId: polecatId, confirmed: true });
+    expect(second).toMatchObject({ ended: true, needsConfirmation: false });
+    const archives = host.harness.inspection.sdk.callsTo("threads.archive");
+    expect(archives.some((call) => (call[0] as { threadId: string }).threadId === polecatId)).toBe(true);
+
+    const status = (await host.harness.behavior.callRpc("status", null)) as {
+      threads: { threadId: string; state: string }[];
+    };
+    expect(status.threads.find((thread) => thread.threadId === polecatId)?.state).toBe("archived");
+  });
+});
