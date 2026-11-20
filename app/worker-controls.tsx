@@ -11,10 +11,37 @@ import { Textarea } from "@/components/ui/textarea";
 import type { rpcContract } from "../server";
 
 /**
+ * A draft kept in the browser's localStorage, keyed by thread. It outlives the
+ * control's mount, so words typed then switched away are still there — written
+ * on every change, not on blur. Storage unavailable (e.g. a sandboxed context)
+ * falls back to in-memory only.
+ */
+function useDraft(key: string): [string, (next: string) => void] {
+  const [value, setValue] = useState(() => {
+    try {
+      return window.localStorage.getItem(key) ?? "";
+    } catch {
+      return "";
+    }
+  });
+  const set = (next: string): void => {
+    setValue(next);
+    try {
+      if (next === "") window.localStorage.removeItem(key);
+      else window.localStorage.setItem(key, next);
+    } catch {
+      /* storage unavailable — the draft lives in memory only */
+    }
+  };
+  return [value, set];
+}
+
+/**
  * One worker's controls. Steer queues a message behind the worker's current
  * turn, or — with the box checked — steers the running turn in place. Interrupt
  * stops the turn. End archives the worker; the server asks to confirm when the
- * worker still has open work, so nothing live is dropped on a first press.
+ * worker still has open work, so nothing live is dropped on a first press. A
+ * Note leaves words for the Mayor about this worker, from a draft that persists.
  */
 export function WorkerControls({ threadId }: { threadId: string }) {
   const rpc = useRpc<typeof rpcContract>();
@@ -22,6 +49,8 @@ export function WorkerControls({ threadId }: { threadId: string }) {
   const [steerOpen, setSteerOpen] = useState(false);
   const [steerText, setSteerText] = useState("");
   const [steerNow, setSteerNow] = useState(false);
+  const [noteOpen, setNoteOpen] = useState(false);
+  const [noteText, setNoteText] = useDraft(`madmax-note:${threadId}`);
   const [confirmEnd, setConfirmEnd] = useState(false);
 
   async function run(action: () => Promise<unknown>, success: string): Promise<void> {
@@ -46,6 +75,21 @@ export function WorkerControls({ threadId }: { threadId: string }) {
 
   function interrupt(): void {
     void run(() => rpc.call("townInterrupt", { threadId }), "Interrupted.");
+  }
+
+  function note(): void {
+    const text = noteText.trim();
+    if (!text || busy) return;
+    setBusy(true);
+    rpc
+      .call("townNote", { threadId, text })
+      .then(() => {
+        toast.success("Note sent to the Mayor.");
+        setNoteOpen(false);
+        setNoteText("");
+      })
+      .catch((cause) => toast.error(cause instanceof Error ? cause.message : String(cause)))
+      .finally(() => setBusy(false));
   }
 
   function end(confirmed: boolean): void {
@@ -76,6 +120,9 @@ export function WorkerControls({ threadId }: { threadId: string }) {
         <Button size="sm" variant="outline" disabled={busy} onClick={interrupt}>
           <Icon name="Stop" className="size-3" /> Interrupt
         </Button>
+        <Button size="sm" variant="outline" disabled={busy} onClick={() => setNoteOpen((open) => !open)}>
+          <Icon name="MessageSquare" className="size-3" /> Note
+        </Button>
         <Button size="sm" variant="outline" className="text-destructive" disabled={busy} onClick={() => end(false)}>
           <Icon name="Archive" className="size-3" /> End
         </Button>
@@ -101,6 +148,24 @@ export function WorkerControls({ threadId }: { threadId: string }) {
                 Send
               </Button>
             </div>
+          </div>
+        </div>
+      ) : null}
+      {noteOpen ? (
+        <div className="flex flex-col gap-1.5">
+          <Textarea
+            value={noteText}
+            onChange={(event) => setNoteText(event.target.value)}
+            placeholder="A note for the Mayor about this worker…"
+            className="max-h-40 min-h-7 resize-none"
+          />
+          <div className="flex justify-end gap-1.5">
+            <Button size="sm" variant="ghost" disabled={busy} onClick={() => setNoteOpen(false)}>
+              Cancel
+            </Button>
+            <Button size="sm" disabled={busy || !noteText.trim()} onClick={note}>
+              Send
+            </Button>
           </div>
         </div>
       ) : null}

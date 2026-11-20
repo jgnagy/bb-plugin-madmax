@@ -2000,4 +2000,17 @@ describe("worker controls (townNudge / townInterrupt / townEnd)", () => {
     };
     expect(status.threads.find((thread) => thread.threadId === polecatId)?.state).toBe("archived");
   });
+
+  it("townNote delivers a note about the worker to the Mayor", async () => {
+    const { host, mayorId, polecatId } = await makeWorkerHost();
+    const result = await host.harness.behavior.callRpc("townNote", { threadId: polecatId, text: "Watch the totals." });
+    expect(result).toMatchObject({ threadId: polecatId });
+    const sends = host.harness.inspection.sdk.callsTo("threads.send");
+    const toMayor = sends.find((call) => (call[0] as { threadId: string }).threadId === mayorId);
+    expect(toMayor).toBeDefined();
+    expect(toMayor![0] as { mode: string }).toMatchObject({ mode: "queue-if-active" });
+    expect(toMayor![0] as { input: { type: string; text: string }[] }).toMatchObject({
+      input: [{ type: "text", text: expect.stringContaining("Watch the totals.") }],
+    });
+  });
 });

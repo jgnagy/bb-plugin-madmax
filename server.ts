@@ -434,6 +434,10 @@ export const rpcContract = defineRpcContract({
     input: z.object({ threadId: z.string().trim().min(1), confirmed: z.boolean().optional() }).strict(),
     output: z.object({ threadId: z.string(), ended: z.boolean(), needsConfirmation: z.boolean() }).strict(),
   },
+  townNote: {
+    input: z.object({ threadId: z.string().trim().min(1), text: z.string().trim().min(1).max(MAX_RESULT_LENGTH) }).strict(),
+    output: z.object({ threadId: z.string() }).strict(),
+  },
 });
 
 interface ManagedRow {
@@ -1880,6 +1884,22 @@ export default async function plugin(bb: BbPluginApi) {
     publishTown();
     logEvent("end", `Ended “${row.title}”`, threadId);
     return { threadId, ended: true, needsConfirmation: false };
+  }
+
+  /** Deliver a note about a worker to the Mayor, to act on as it sees fit. */
+  async function noteToMayor(threadId: string, text: string) {
+    const row = requireWorker(threadId);
+    const mayor = mayorRow();
+    if (!mayor || ["complete", "archived", "deleted"].includes(mayor.state)) {
+      throw new Error("Start the Mayor for the town before leaving a note.");
+    }
+    await bb.sdk.threads.send({
+      threadId: mayor.thread_id,
+      mode: "queue-if-active",
+      input: [{ type: "text", text: `Note about worker “${row.title}” (${threadId}): ${clip(text, MAX_RESULT_LENGTH)}`, mentions: [] }],
+    });
+    logEvent("note", `Note to the Mayor about “${row.title}”`, threadId);
+    return { threadId };
   }
 
   function enqueueAlert(row: ManagedRow, key: string, message: string, targetOverride?: string) {
@@ -3586,6 +3606,7 @@ export default async function plugin(bb: BbPluginApi) {
     },
     townInterrupt: ({ threadId }) => interruptWorker(threadId),
     townEnd: ({ threadId, confirmed }) => endWorker(threadId, confirmed ?? false),
+    townNote: ({ threadId, text }) => noteToMayor(threadId, text),
   });
 
   const usage = [
@@ -3606,6 +3627,7 @@ export default async function plugin(bb: BbPluginApi) {
     "  bb madmax nudge <thread-id> --text \"…\" [--steer] [--authorize-edits] [--json]",
     "  bb madmax interrupt <thread-id> [--json]",
     "  bb madmax end <thread-id> [--confirmed] [--json]",
+    "  bb madmax note <thread-id> --text \"…\" [--json]",
     "  bb madmax inspect <thread-id>",
     "  bb madmax review <thread-id> [--focus \"…\"] [--mode lite|full] [--json]",
     "  bb madmax verify <thread-id>",
@@ -3633,6 +3655,7 @@ export default async function plugin(bb: BbPluginApi) {
       { name: "nudge", summary: "Nudge a managed polecat", usage: "bb madmax nudge <thread-id> --text \"…\" [--steer] [--authorize-edits] [--json]" },
       { name: "interrupt", summary: "Stop a worker's running turn", usage: "bb madmax interrupt <thread-id> [--json]" },
       { name: "end", summary: "End a worker and archive its worktree", usage: "bb madmax end <thread-id> [--confirmed] [--json]" },
+      { name: "note", summary: "Leave a note about a worker for the Mayor", usage: "bb madmax note <thread-id> --text \"…\" [--json]" },
       { name: "inspect", summary: "Inspect a managed thread's evidence", usage: "bb madmax inspect <thread-id>" },
       { name: "review", summary: "Start an adversarial review of an idle polecat's work", usage: "bb madmax review <thread-id> [--focus \"…\"] [--mode lite|full] [--json]" },
       { name: "verify", summary: "Gather git evidence from a managed thread's worktree", usage: "bb madmax verify <thread-id>" },
@@ -3809,6 +3832,13 @@ export default async function plugin(bb: BbPluginApi) {
           if (!threadId) return fail("end requires <thread-id>");
           const result = await endWorker(threadId, args.bool("confirmed"));
           return ok(result, result.needsConfirmation ? `End ${result.threadId} confirmed? (uncommitted work is lost)` : `Ended ${result.threadId}.`);
+        }
+        if (command === "note") {
+          const threadId = args.positional[0];
+          const text = args.one("text");
+          if (!threadId || !text) return fail("note requires <thread-id> and --text");
+          await noteToMayor(threadId, text);
+          return ok({ threadId }, `Note delivered to the Mayor about ${threadId}.`);
         }
         if (command === "review") {
           const threadId = args.positional[0];
