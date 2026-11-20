@@ -1927,7 +1927,7 @@ describe("worker controls (townNudge / townInterrupt / townEnd)", () => {
   });
 
   /** A town with one slung polecat; returns the mayor and polecat thread ids. */
-  async function makeWorkerHost() {
+  async function makeWorkerHost(options: { status?: string } = {}) {
     const host = createFakePluginHost({ pluginId: "madmax", agentSkillIds: ["mayor", "polecat"] });
     hosts.push(host);
     await plugin(host.bb);
@@ -1937,7 +1937,7 @@ describe("worker controls (townNudge / townInterrupt / townEnd)", () => {
     host.harness.inspection.sdk.stub("threads.send", () => ({ ok: true }));
     host.harness.inspection.sdk.stub("threads.stop", () => ({ ok: true }));
     host.harness.inspection.sdk.stub("threads.archive", () => ({ ok: true }));
-    host.harness.inspection.sdk.stub("threads.get", () => ({ status: "active", deletedAt: null, archivedAt: null }));
+    host.harness.inspection.sdk.stub("threads.get", () => ({ status: options.status ?? "active", deletedAt: null, archivedAt: null }));
     let counter = 0;
     const spawned: string[] = [];
     host.harness.inspection.sdk.stub("threads.spawn", () => {
@@ -1982,6 +1982,13 @@ describe("worker controls (townNudge / townInterrupt / townEnd)", () => {
     expect(result).toMatchObject({ threadId: polecatId });
     const stops = host.harness.inspection.sdk.callsTo("threads.stop");
     expect(stops.some((call) => (call[0] as { threadId: string }).threadId === polecatId)).toBe(true);
+  });
+
+  it("townInterrupt leaves an idle turn alone — no stop is issued", async () => {
+    const { host, polecatId } = await makeWorkerHost({ status: "idle" });
+    const result = await host.harness.behavior.callRpc("townInterrupt", { threadId: polecatId });
+    expect(result).toMatchObject({ threadId: polecatId, stopped: false });
+    expect(host.harness.inspection.sdk.callsTo("threads.stop")).toHaveLength(0);
   });
 
   it("townEnd asks to confirm when the worker still has open work, then ends it", async () => {

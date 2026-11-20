@@ -1857,7 +1857,11 @@ export default async function plugin(bb: BbPluginApi) {
     const row = requireWorker(threadId);
     const live = await bb.sdk.threads.get({ threadId });
     const wasBusy = BUSY_STATUSES.has(live.status);
-    await bb.sdk.threads.stop({ threadId });
+    // Only stop a thread that actually has a running turn. An idle thread has
+    // nothing to release, and stopping one needn't be a harmless no-op.
+    if (wasBusy) {
+      await bb.sdk.threads.stop({ threadId });
+    }
     logEvent("interrupt", `Interrupted “${row.title}”${wasBusy ? "" : " (it was not running a turn)"}`, threadId);
     reloadRoles();
     publishTown();
