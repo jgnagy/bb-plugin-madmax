@@ -10,12 +10,13 @@ import { homedir, tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 import { promisify } from "node:util";
 import { afterEach, describe, expect, it } from "vitest";
+import { z } from "zod";
 import {
   createFakePluginHost,
   makePluginAgentConfigurationContext,
   makeThreadResponse,
 } from "@get-bb/plugin-sdk/testing";
-import plugin, { detectGiteaCli, forgeFromRemote, looksLikeGiteaCli, parseForgePrState, parsePrUrls, type Bead } from "./server";
+import plugin, { detectGiteaCli, forgeFromRemote, looksLikeGiteaCli, parseForgePrState, parsePrUrls, parseReport, reportParams, reportRules, type Bead } from "./server";
 
 const execFileAsync = promisify(execFile);
 const bdAvailable = await execFileAsync("bd", ["--version"])
@@ -2026,5 +2027,32 @@ describe("worker controls (townNudge / townInterrupt / townEnd)", () => {
     expect(toMayor![0] as { input: { type: string; text: string }[] }).toMatchObject({
       input: [{ type: "text", text: expect.stringContaining("Watch the totals.") }],
     });
+  });
+});
+
+describe("polecat_report schema", () => {
+  it("exports a top-level object JSON schema for provider tool validation", () => {
+    const schema = z.toJSONSchema(reportParams) as { type?: string; anyOf?: unknown };
+    expect(schema.type).toBe("object");
+    expect(schema.anyOf).toBeUndefined();
+  });
+
+  it("enforces ready and blocked rules at runtime", () => {
+    expect(() => reportRules.parse({ state: "ready" })).toThrow();
+    expect(() => reportRules.parse({ state: "blocked", blocker: "x" })).toThrow();
+    expect(() => reportRules.parse({ state: "blocked", recommendation: "x" })).toThrow();
+    expect(reportRules.parse({ state: "ready", result: "Done." }).state).toBe("ready");
+    expect(() => reportRules.parse({ state: "ready", result: "   " })).toThrow();
+    expect(() => reportRules.parse({ state: "active", blocker: "x" })).toThrow();
+    expect(() => reportRules.parse({ state: "blocked", blocker: "  ", recommendation: "x" })).toThrow();
+    expect(() => reportRules.parse({ state: "blocked", blocker: "x", recommendation: "  " })).toThrow();
+    expect(reportRules.parse({ state: "idle" }).state).toBe("idle");
+    expect(() => reportRules.parse({ state: "idle", blocker: "x" })).toThrow();
+    expect(() => reportRules.parse({ state: "failed", blocker: "x" })).toThrow();
+    expect(reportRules.parse({ state: "failed", result: "Lint broke" }).state).toBe("failed");
+    expect(() => parseReport({ state: "ready" })).toThrow(/Invalid polecat_report: result: /);
+    expect(
+      reportRules.parse({ state: "blocked", blocker: "Needs creds", recommendation: "Log in" }).state,
+    ).toBe("blocked");
   });
 });
