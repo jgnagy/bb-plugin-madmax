@@ -2042,6 +2042,11 @@ describe("polecat_report schema", () => {
     expect(() => reportRules.parse({ state: "blocked", blocker: "x" })).toThrow();
     expect(() => reportRules.parse({ state: "blocked", recommendation: "x" })).toThrow();
     expect(reportRules.parse({ state: "ready", result: "Done." }).state).toBe("ready");
+    expect(() => reportRules.parse({ state: "ready", result: "   " })).toThrow();
+    expect(() => reportRules.parse({ state: "active", blocker: "x" })).toThrow();
+    expect(() => reportRules.parse({ state: "blocked", blocker: "  ", recommendation: "x" })).toThrow();
+    expect(() => reportRules.parse({ state: "blocked", blocker: "x", recommendation: "  " })).toThrow();
+    expect(reportRules.parse({ state: "idle" }).state).toBe("idle");
     expect(
       reportRules.parse({ state: "blocked", blocker: "Needs creds", recommendation: "Log in" }).state,
     ).toBe("blocked");
