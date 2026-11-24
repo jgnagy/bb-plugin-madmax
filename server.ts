@@ -222,8 +222,17 @@ export const reportParams = z.object({
   state: z.enum(["active", "idle", "failed", "ready", "blocked"]),
   result: z.string().trim().max(MAX_RESULT_LENGTH).optional(),
   blocker: z.string().trim().min(1).max(4_000).optional(),
-  recommendation: z.string().trim().min(1).max(4_000).optional(),
+  recommendation: z.string().trim().max(4_000).optional(),
 });
+
+// Runtime enforcement for polecat_report: the flat schema above is what
+// providers see; these rules decide what is actually recorded.
+export function parseReport(params: unknown): z.infer<typeof reportRules> {
+  const parsed = reportRules.safeParse(params);
+  if (parsed.success) return parsed.data;
+  const problems = parsed.error.issues.map((issue) => `${issue.path.join(".") || "report"}: ${issue.message}`);
+  throw new Error(`Invalid polecat_report: ${problems.join("; ")}`);
+}
 export const reportRules = z.discriminatedUnion("state", [optionalReport, readyReport, blockedReport]);
 
 /** A bd issue as returned by `bd list/show --json` (fields we rely on). */
@@ -3452,7 +3461,7 @@ export default async function plugin(bb: BbPluginApi) {
     parameters: reportParams,
     async execute(params, context) {
       if (!context.threadId) throw new Error("polecat_report requires a thread context.");
-      await report(context.threadId, reportRules.parse(params));
+      await report(context.threadId, parseReport(params));
       return "Report delivered.";
     },
   });

@@ -16,7 +16,7 @@ import {
   makePluginAgentConfigurationContext,
   makeThreadResponse,
 } from "@get-bb/plugin-sdk/testing";
-import plugin, { detectGiteaCli, forgeFromRemote, looksLikeGiteaCli, parseForgePrState, parsePrUrls, reportParams, reportRules, type Bead } from "./server";
+import plugin, { detectGiteaCli, forgeFromRemote, looksLikeGiteaCli, parseForgePrState, parsePrUrls, parseReport, reportParams, reportRules, type Bead } from "./server";
 
 const execFileAsync = promisify(execFile);
 const bdAvailable = await execFileAsync("bd", ["--version"])
@@ -2047,6 +2047,10 @@ describe("polecat_report schema", () => {
     expect(() => reportRules.parse({ state: "blocked", blocker: "  ", recommendation: "x" })).toThrow();
     expect(() => reportRules.parse({ state: "blocked", blocker: "x", recommendation: "  " })).toThrow();
     expect(reportRules.parse({ state: "idle" }).state).toBe("idle");
+    expect(() => reportRules.parse({ state: "idle", blocker: "x" })).toThrow();
+    expect(() => reportRules.parse({ state: "failed", blocker: "x" })).toThrow();
+    expect(reportRules.parse({ state: "failed", result: "Lint broke" }).state).toBe("failed");
+    expect(() => parseReport({ state: "ready" })).toThrow(/Invalid polecat_report: result: /);
     expect(
       reportRules.parse({ state: "blocked", blocker: "Needs creds", recommendation: "Log in" }).state,
     ).toBe("blocked");
